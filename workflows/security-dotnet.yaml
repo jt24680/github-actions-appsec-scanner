@@ -1,0 +1,162 @@
+name: .NET Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dotnet-vulnerable-packages:
+    name: .NET Vulnerable Packages (${{ matrix.dotnet-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        dotnet-version: ['8.0.x', '9.0.x', '10.0.x']
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed .NET files
+        id: check_dotnet
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_dotnet=true" >> $GITHUB_OUTPUT
+            echo "No PR context — scanning all .NET files"
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.(csproj|fsproj|vbproj|sln|cs|fs|vb)$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_dotnet=true" >> $GITHUB_OUTPUT
+            echo ".NET files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_dotnet=false" >> $GITHUB_OUTPUT
+            echo "No .NET files changed in this PR"
+          fi
+
+      - name: Setup .NET
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: ${{ matrix.dotnet-version }}
+
+      - name: Restore dependencies
+        id: dotnet_restore
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        run: dotnet restore
+
+      - name: Check for vulnerable packages
+        if: steps.check_dotnet.outputs.has_dotnet == 'true' && steps.dotnet_restore.outcome == 'success'
+        continue-on-error: true
+        run: |
+          dotnet list package --vulnerable --include-transitive --format json > vulnerable-packages.json
+
+      - name: Set up Python
+        if: steps.check_dotnet.outputs.has_dotnet == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.check_dotnet.outputs.has_dotnet == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "dotnet-vulnerable-packages-${{ matrix.dotnet-version }}",
+                          "informationUri": "https://learn.microsoft.com/en-us/nuget/concepts/auditing-packages"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('vulnerable-packages.json', 'r') as f:
+                  data = json.load(f)
+
+              for project in data.get('projects', []):
+                  project_path = project.get('path', 'unknown')
+
+                  for framework in project.get('frameworks', []):
+                      all_packages = framework.get('topLevelPackages', []) + framework.get('transitivePackages', [])
+
+                      for vuln_pkg in all_packages:
+                          if not vuln_pkg.get('vulnerabilities'):
+                              continue
+
+                          pkg_name = vuln_pkg.get('id', 'unknown')
+                          pkg_version = vuln_pkg.get('resolvedVersion', 'unknown')
+
+                          for vuln in vuln_pkg.get('vulnerabilities', []):
+                              severity_map = {
+                                  'Critical': 'error',
+                                  'High': 'error',
+                                  'Moderate': 'warning',
+                                  'Medium': 'warning',
+                                  'Low': 'note'
+                              }
+
+                              severity = vuln.get('severity', 'Moderate')
+                              advisory_url = vuln.get('advisoryUrl', '')
+
+                              message = f"Vulnerable package: {pkg_name} {pkg_version} - {severity} severity"
+                              if advisory_url:
+                                  message += f". See: {advisory_url}"
+
+                              result = {
+                                  "ruleId": f"nuget-vulnerability-{severity.lower()}",
+                                  "level": severity_map.get(severity, 'warning'),
+                                  "message": {"text": message},
+                                  "locations": [{
+                                      "physicalLocation": {
+                                          "artifactLocation": {"uri": project_path},
+                                          "region": {"startLine": 1}
+                                      }
+                                  }],
+                                  "properties": {
+                                      "package": pkg_name,
+                                      "version": pkg_version,
+                                      "advisory": advisory_url
+                                  }
+                              }
+                              sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing vulnerable packages: {e}")
+
+          with open('dotnet-vulnerable.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate .NET SARIF
+        if: always() && steps.check_dotnet.outputs.has_dotnet == 'true'
+        run: |
+          set -euo pipefail
+          [ -s dotnet-vulnerable.sarif ] || { echo "::error::dotnet-vulnerable.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('dotnet-vulnerable.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dotnet-vulnerable-sarif-${{ matrix.dotnet-version }}
+          path: dotnet-vulnerable.sarif
+          retention-days: 1

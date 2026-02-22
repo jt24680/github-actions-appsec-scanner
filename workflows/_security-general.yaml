@@ -1,0 +1,386 @@
+name: General Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep:1.152.0@sha256:e04d2cb132288d90035db8791d64f610cb255b21e727b94db046243b30c01ae9
+    if: github.actor != 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Semgrep rules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/semgrep
+          key: ${{ runner.os }}-semgrep-rules-${{ hashFiles('.semgrep/**') }}-${{ hashFiles('.github/workflows/_security-general.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-semgrep-rules-
+
+      - name: Run Semgrep
+        continue-on-error: true
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+        run: |
+          BASELINE_ARGS=""
+          if [ -n "$PR_BASE_SHA" ]; then
+            BASELINE_ARGS="--baseline-commit $PR_BASE_SHA"
+          fi
+          semgrep scan \
+            $BASELINE_ARGS \
+            --config=auto \
+            --exclude="*_test.go" \
+            --exclude="*_test.py" \
+            --exclude="*.test.js" \
+            --exclude="*.spec.ts" \
+            --exclude="test/*" \
+            --exclude="tests/*" \
+            --exclude="__tests__/*" \
+            --sarif -o semgrep.sarif
+
+      - name: Validate Semgrep SARIF
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s semgrep.sarif ] || { echo "::error::semgrep.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('semgrep.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Check for ERROR-level findings
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -f semgrep.sarif ]; then
+            ERRORS=$(python3 -c "
+          import json
+          with open('semgrep.sarif') as f:
+              sarif = json.load(f)
+          count = 0
+          for run in sarif.get('runs', []):
+              for result in run.get('results', []):
+                  if result.get('level') == 'error':
+                      count += 1
+          print(count)
+          ")
+            echo "ERROR-level findings: $ERRORS"
+            if [ "$ERRORS" -gt 0 ]; then
+              echo "::warning::Found $ERRORS ERROR-level findings - review recommended"
+            fi
+          else
+            echo "No semgrep.sarif file found, skipping ERROR check"
+          fi
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          retention-days: 1
+
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run Trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret,config'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'trivy.sarif'
+
+      - name: Validate Trivy SARIF
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s trivy.sarif ] || { echo "::error::trivy.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('trivy.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trivy-sarif
+          path: trivy.sarif
+          retention-days: 1
+
+  trufflehog:
+    name: TruffleHog
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          IMAGE="trufflesecurity/trufflehog:3.93.4@sha256:9a67b6d931488173eb093826eb0eec1141188e1511309801168387e65a485762"
+          PULL_OK=false
+
+          for i in 1 2 3; do
+            if docker pull "$IMAGE"; then
+              PULL_OK=true
+              break
+            fi
+            if [ "$i" -lt 3 ]; then
+              echo "Attempt $i/3 failed, retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+          if [ "$PULL_OK" != "true" ]; then
+            echo "::error::Failed to pull $IMAGE after 3 attempts"
+            exit 1
+          fi
+
+          docker run --rm -v "$PWD:/pwd" "$IMAGE" \
+            filesystem /pwd \
+            --json | python3 -c "
+          import sys, json
+          for line in sys.stdin:
+              try:
+                  obj = json.loads(line)
+                  obj.pop('Raw', None)
+                  obj.pop('RawV2', None)
+                  print(json.dumps(obj))
+              except Exception:
+                  pass
+          " > trufflehog.json
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TruffleHog",
+                          "version": "3.93.4"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('trufflehog.json', 'r') as f:
+                  for line in f:
+                      try:
+                          finding = json.loads(line.strip())
+
+                          detector = finding.get('DetectorName', 'secret-detected')
+                          source_metadata = finding.get('SourceMetadata', {}).get('Data', {})
+                          filesystem_data = source_metadata.get('Filesystem', {})
+                          filepath = filesystem_data.get('file', 'unknown')
+
+                          result = {
+                              "ruleId": detector,
+                              "level": "error",
+                              "message": {"text": f"Secret detected: {detector}"},
+                              "locations": [{
+                                  "physicalLocation": {
+                                      "artifactLocation": {"uri": filepath},
+                                      "region": {"startLine": 1}
+                                  }
+                              }]
+                          }
+                          sarif["runs"][0]["results"].append(result)
+                      except Exception as e:
+                          print(f"Warning: skipping malformed TruffleHog finding: {e}")
+                          continue
+          except Exception as e:
+              raise SystemExit(f"Error reading trufflehog.json: {e}")
+
+          with open('trufflehog.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Cleanup raw TruffleHog results
+        if: always()
+        run: rm -f trufflehog.json
+
+      - name: Validate TruffleHog SARIF
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s trufflehog.sarif ] || { echo "::error::trufflehog.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('trufflehog.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trufflehog-sarif
+          path: trufflehog.sarif
+          retention-days: 1
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@05fe4576374b728f0c523d6a13d64c25081e0803 # v4
+        with:
+          fail-on-severity: critical
+          comment-summary-in-pr: 'always'
+
+  license-scan:
+    name: License Compliance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run Trivy license scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'license'
+          format: 'json'
+          output: 'trivy-license.json'
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        run: |
+          python3 << 'EOF'
+          import json
+
+          # Licenses considered restrictive for proprietary/commercial use
+          RESTRICTED_LICENSES = {
+              'AGPL-1.0', 'AGPL-1.0-only', 'AGPL-1.0-or-later',
+              'AGPL-3.0', 'AGPL-3.0-only', 'AGPL-3.0-or-later',
+              'GPL-2.0', 'GPL-2.0-only', 'GPL-2.0-or-later',
+              'GPL-3.0', 'GPL-3.0-only', 'GPL-3.0-or-later',
+              'SSPL-1.0', 'EUPL-1.1', 'EUPL-1.2',
+              'OSL-3.0', 'CPAL-1.0', 'CPL-1.0',
+          }
+
+          COPYLEFT_LICENSES = {
+              'LGPL-2.0', 'LGPL-2.0-only', 'LGPL-2.0-or-later',
+              'LGPL-2.1', 'LGPL-2.1-only', 'LGPL-2.1-or-later',
+              'LGPL-3.0', 'LGPL-3.0-only', 'LGPL-3.0-or-later',
+              'MPL-2.0', 'EPL-1.0', 'EPL-2.0',
+          }
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "license-scan",
+                          "informationUri": "https://aquasecurity.github.io/trivy/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('trivy-license.json', 'r') as f:
+                  data = json.load(f)
+
+              results_list = data if isinstance(data, list) else data.get('Results', [])
+
+              for target in results_list:
+                  target_name = target.get('Target', 'unknown')
+                  licenses = target.get('Licenses', [])
+
+                  for lic in (licenses or []):
+                      pkg_name = lic.get('PkgName', 'unknown')
+                      license_name = lic.get('Name', 'unknown')
+                      category = lic.get('Category', '')
+                      filepath = lic.get('FilePath', target_name)
+
+                      if license_name in RESTRICTED_LICENSES:
+                          level = 'error'
+                          message = f"Restricted license: {pkg_name} uses {license_name} (strong copyleft). Review required for commercial use."
+                      elif license_name in COPYLEFT_LICENSES:
+                          level = 'warning'
+                          message = f"Copyleft license: {pkg_name} uses {license_name} (weak copyleft). Verify linking compliance."
+                      elif category in ('restricted', 'forbidden'):
+                          level = 'error'
+                          message = f"Restricted license: {pkg_name} uses {license_name}. Review required."
+                      elif category in ('reciprocal',):
+                          level = 'warning'
+                          message = f"Reciprocal license: {pkg_name} uses {license_name}. Verify compliance."
+                      else:
+                          continue
+
+                      result = {
+                          "ruleId": f"license-{license_name}",
+                          "level": level,
+                          "message": {"text": message},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": 1}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing license scan results: {e}")
+
+          with open('license-scan.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate License SARIF
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s license-scan.sarif ] || { echo "::error::license-scan.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('license-scan.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: license-scan-sarif
+          path: license-scan.sarif
+          retention-days: 1

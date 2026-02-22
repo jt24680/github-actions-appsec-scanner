@@ -1,0 +1,294 @@
+name: SQL Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sqlfluff:
+    name: SQLFluff
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed SQL files
+        id: changed_sql
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            find . -name '*.sql' -not -path './.git/*' > changed_sql_files.txt
+            if [ -s changed_sql_files.txt ]; then
+              echo "has_sql=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all SQL files"
+            else
+              echo "has_sql=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.sql$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_sql=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_sql_files.txt
+            echo "SQL files changed:"
+            cat changed_sql_files.txt
+          else
+            echo "has_sql=false" >> $GITHUB_OUTPUT
+            echo "No SQL files changed in this PR"
+          fi
+
+      - name: Set up Python
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache SQLFluff
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-sqlfluff-${{ hashFiles('.github/workflows/security-sql.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-sqlfluff-
+
+      - name: Install SQLFluff
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        run: for i in 1 2 3; do pip install sqlfluff==4.0.4 sqlfluff-templater-dbt==4.0.4 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+
+      - name: Run SQLFluff
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        continue-on-error: true
+        run: |
+          xargs -d '\n' sqlfluff lint --format json --dialect ansi < changed_sql_files.txt > sqlfluff.json
+
+      - name: Convert to SARIF
+        if: always() && steps.changed_sql.outputs.has_sql == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "SQLFluff",
+                          "version": "4.0.4",
+                          "informationUri": "https://www.sqlfluff.com/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('sqlfluff.json', 'r') as f:
+                  data = json.load(f)
+
+              for file_entry in data:
+                  filepath = file_entry.get('filepath', 'unknown')
+                  for violation in file_entry.get('violations', []):
+                      rule_code = violation.get('code', 'unknown')
+                      description = violation.get('description', 'No description')
+                      line = violation.get('start_line_no', violation.get('line_no', 1))
+                      col = violation.get('start_line_pos', violation.get('line_pos', 1))
+
+                      # SQLFluff 4.x uses new naming: AM, CV, LT, RF, ST, etc.
+                      # Map layout/style rules to note, anti-pattern rules to warning
+                      prefix = rule_code[:2] if len(rule_code) >= 2 else ''
+                      if prefix in ('LT', 'CV'):
+                          level = 'note'
+                      elif prefix in ('AM', 'ST', 'RF', 'JJ', 'CP'):
+                          level = 'warning'
+                      else:
+                          level = 'warning'
+
+                      result = {
+                          "ruleId": rule_code,
+                          "level": level,
+                          "message": {"text": description},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": line, "startColumn": col}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing SQLFluff results: {e}")
+
+          with open('sqlfluff.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate SQLFluff SARIF
+        if: always() && steps.changed_sql.outputs.has_sql == 'true'
+        run: |
+          set -euo pipefail
+          [ -s sqlfluff.sarif ] || { echo "::error::sqlfluff.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('sqlfluff.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sqlfluff-sarif
+          path: sqlfluff.sarif
+          retention-days: 1
+
+  tsqllint:
+    name: TSQLLint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed SQL files
+        id: changed_sql
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            find . -name '*.sql' -not -path './.git/*' > changed_sql_files.txt
+            if [ -s changed_sql_files.txt ]; then
+              echo "has_sql=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all SQL files"
+            else
+              echo "has_sql=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.sql$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_sql=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_sql_files.txt
+            echo "SQL files changed:"
+            cat changed_sql_files.txt
+          else
+            echo "has_sql=false" >> $GITHUB_OUTPUT
+            echo "No SQL files changed in this PR"
+          fi
+
+      - name: Setup .NET
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache .NET tools
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.dotnet/tools
+          key: ${{ runner.os }}-dotnet-tools-tsqllint
+          restore-keys: |
+            ${{ runner.os }}-dotnet-tools-
+
+      - name: Install TSQLLint
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        run: |
+          if dotnet tool list --global | grep -Eiq '^[[:space:]]*TSQLLint[[:space:]]'; then
+            echo "TSQLLint already installed — updating to 1.16.0"
+            for i in 1 2 3; do dotnet tool update --global TSQLLint --version 1.16.0 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+          else
+            for i in 1 2 3; do dotnet tool install --global TSQLLint --version 1.16.0 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+          fi
+
+      - name: Run TSQLLint
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        continue-on-error: true
+        run: |
+          xargs -d '\n' ~/.dotnet/tools/tsqllint < changed_sql_files.txt > tsqllint.txt
+
+      - name: Set up Python
+        if: steps.changed_sql.outputs.has_sql == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.changed_sql.outputs.has_sql == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+          import re
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TSQLLint",
+                          "version": "1.16.0"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('tsqllint.txt', 'r') as f:
+                  lines = f.readlines()
+
+              pattern = r'(.+?)\((\d+),(\d+)\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
+
+              for line in lines:
+                  match = re.match(pattern, line, re.IGNORECASE)
+                  if match:
+                      filepath, line_num, col_num, level, code, message = match.groups()
+
+                      level_map = {'error': 'error', 'warning': 'warning', 'information': 'note'}
+                      sarif_level = level_map.get(level.lower(), 'warning')
+
+                      result = {
+                          "ruleId": code,
+                          "level": sarif_level,
+                          "message": {"text": message.strip()},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": int(line_num), "startColumn": int(col_num)}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing TSQLLint results: {e}")
+
+          with open('tsqllint.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate TSQLLint SARIF
+        if: always() && steps.changed_sql.outputs.has_sql == 'true'
+        run: |
+          set -euo pipefail
+          [ -s tsqllint.sarif ] || { echo "::error::tsqllint.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('tsqllint.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tsqllint-sarif
+          path: tsqllint.sarif
+          retention-days: 1

@@ -1,0 +1,285 @@
+name: Go Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gosec:
+    name: Gosec (Go Security)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Go files
+        id: check_go
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "No PR context — scanning all Go files"
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.go$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go files changed in this PR"
+          fi
+
+      - name: Set up Go
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Gosec
+        if: steps.check_go.outputs.has_go == 'true'
+        continue-on-error: true
+        run: |
+          for i in 1 2 3; do go install github.com/securego/gosec/v2/cmd/gosec@v2.23.0 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+          gosec -fmt sarif -out gosec.sarif -stdout -verbose=text ./...
+
+      - name: Validate Gosec SARIF
+        if: always() && steps.check_go.outputs.has_go == 'true'
+        run: |
+          set -euo pipefail
+          [ -s gosec.sarif ] || { echo "::error::gosec.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('gosec.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gosec-sarif
+          path: gosec.sarif
+          retention-days: 1
+
+  staticcheck:
+    name: Staticcheck (Go Linting)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Go files
+        id: check_go
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "No PR context — scanning all Go files"
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.go$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go files changed in this PR"
+          fi
+
+      - name: Set up Go
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Staticcheck
+        if: steps.check_go.outputs.has_go == 'true'
+        continue-on-error: true
+        uses: dominikh/staticcheck-action@a59b46bc6a3ed113d90f4562922ba956f5db4d37 # v1
+        with:
+          version: "2026.1"
+          install-go: false
+          output-format: sarif
+          output-file: staticcheck.sarif
+
+      - name: Validate Staticcheck SARIF
+        if: always() && steps.check_go.outputs.has_go == 'true'
+        run: |
+          set -euo pipefail
+          [ -s staticcheck.sarif ] || { echo "::error::staticcheck.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('staticcheck.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: staticcheck-sarif
+          path: staticcheck.sarif
+          retention-days: 1
+
+  govulncheck:
+    name: Govulncheck (Go Vulnerabilities)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Go files
+        id: check_go
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "No PR context — scanning all Go files"
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.go$|go\.mod$|go\.sum$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go files changed in this PR"
+          fi
+
+      - name: Set up Go
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install govulncheck
+        if: steps.check_go.outputs.has_go == 'true'
+        run: for i in 1 2 3; do go install golang.org/x/vuln/cmd/govulncheck@v1.1.4 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+
+      - name: Run govulncheck
+        if: steps.check_go.outputs.has_go == 'true'
+        continue-on-error: true
+        run: |
+          govulncheck -json ./... > govulncheck.json
+
+      - name: Set up Python
+        if: steps.check_go.outputs.has_go == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.check_go.outputs.has_go == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "govulncheck",
+                          "informationUri": "https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              osv_entries = {}
+              findings = []
+
+              with open('govulncheck.json', 'r') as f:
+                  for line in f:
+                      try:
+                          msg = json.loads(line.strip())
+                      except Exception:
+                          continue
+
+                      if 'osv' in msg:
+                          entry = msg['osv']
+                          osv_entries[entry.get('id', '')] = entry
+
+                      if 'finding' in msg:
+                          findings.append(msg['finding'])
+
+              for finding in findings:
+                  osv_id = finding.get('osv', 'unknown')
+                  osv = osv_entries.get(osv_id, {})
+                  summary = osv.get('summary', 'Vulnerable dependency detected')
+                  aliases = osv.get('aliases', [])
+                  cve = next((a for a in aliases if a.startswith('CVE-')), osv_id)
+
+                  # Extract the trace to find the affected module/package
+                  trace = finding.get('trace', [])
+                  module_name = trace[0].get('module', 'unknown') if trace else 'unknown'
+                  version = trace[0].get('version', 'unknown') if trace else 'unknown'
+
+                  # Find a source file from the trace
+                  source_file = 'go.mod'
+                  source_line = 1
+                  for frame in trace:
+                      if 'position' in frame:
+                          pos = frame['position']
+                          source_file = pos.get('filename', source_file)
+                          source_line = pos.get('line', source_line)
+                          break
+
+                  message = f"{cve}: {summary} (module: {module_name}@{version})"
+
+                  result = {
+                      "ruleId": osv_id,
+                      "level": "error",
+                      "message": {"text": message},
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": source_file},
+                              "region": {"startLine": source_line}
+                          }
+                      }]
+                  }
+                  sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing govulncheck results: {e}")
+
+          with open('govulncheck.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate Govulncheck SARIF
+        if: always() && steps.check_go.outputs.has_go == 'true'
+        run: |
+          set -euo pipefail
+          [ -s govulncheck.sarif ] || { echo "::error::govulncheck.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('govulncheck.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: govulncheck-sarif
+          path: govulncheck.sarif
+          retention-days: 1

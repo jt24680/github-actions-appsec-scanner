@@ -1,0 +1,273 @@
+name: JavaScript/TypeScript Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  npm-audit:
+    name: npm audit (JS/TS Dependencies)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed JS/TS files
+        id: check_js
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            if find . -name "package.json" -maxdepth 3 -not -path '*/node_modules/*' | grep -q .; then
+              echo "has_js=true" >> $GITHUB_OUTPUT
+              echo "No PR context — auditing all JS/TS packages"
+            else
+              echo "has_js=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.(js|jsx|ts|tsx|mjs|cjs)$|package\.json$|yarn\.lock$|package-lock\.json$|pnpm-lock\.yaml$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ] && find . -name "package.json" -maxdepth 3 -not -path '*/node_modules/*' | grep -q .; then
+            echo "has_js=true" >> $GITHUB_OUTPUT
+            echo "JS/TS files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_js=false" >> $GITHUB_OUTPUT
+            echo "No JS/TS files changed in this PR"
+          fi
+
+      - name: Set up Node.js
+        if: steps.check_js.outputs.has_js == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Run npm audit
+        if: steps.check_js.outputs.has_js == 'true'
+        continue-on-error: true
+        run: |
+          # Enable yarn/pnpm shims when repositories use those lockfiles.
+          corepack enable || true
+          : > npm-audit-manifest.txt
+          index=0
+
+          # Find all package.json directories and audit with the correct package manager
+          find . -name "package.json" -maxdepth 3 -not -path '*/node_modules/*' -exec dirname {} \; | sort -u | while read -r dir; do
+            echo "Auditing $dir..."
+            pm=""
+            if [ -f "$dir/yarn.lock" ]; then
+              pm="yarn"
+              echo "Detected yarn in $dir — running yarn audit"
+              (cd "$dir" && yarn npm audit --recursive --json > npm-audit-partial.json 2>/dev/null) || \
+              (cd "$dir" && yarn audit --json > npm-audit-partial.json 2>/dev/null) || true
+            elif [ -f "$dir/pnpm-lock.yaml" ]; then
+              pm="pnpm"
+              echo "Detected pnpm in $dir — running pnpm audit"
+              (cd "$dir" && pnpm audit --json > npm-audit-partial.json 2>/dev/null) || true
+            elif [ -f "$dir/package-lock.json" ]; then
+              pm="npm"
+              (cd "$dir" && npm audit --json > npm-audit-partial.json 2>/dev/null) || true
+            else
+              echo "No lock file in $dir — skipping (cannot reliably audit without a lock file)"
+              continue
+            fi
+
+            if [ -f "$dir/npm-audit-partial.json" ]; then
+              index=$((index + 1))
+              output_file="npm-audit-${index}.json"
+              mv "$dir/npm-audit-partial.json" "$output_file"
+              echo "${pm}|${dir}|${output_file}" >> npm-audit-manifest.txt
+            fi
+          done
+
+      - name: Set up Python
+        if: steps.check_js.outputs.has_js == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.check_js.outputs.has_js == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+          import glob
+          import os
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "npm-audit",
+                          "informationUri": "https://docs.npmjs.com/cli/audit"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          severity_map = {
+              'critical': 'error',
+              'high': 'error',
+              'moderate': 'warning',
+              'low': 'note',
+              'info': 'note',
+              'unknown': 'warning',
+          }
+
+          def add_result(package_json, pkg_name, severity, title, url, source_id, range_str='unknown'):
+              message = f"Vulnerable package: {pkg_name} ({range_str}) - {title}"
+              if url:
+                  message += f". See: {url}"
+              sarif["runs"][0]["results"].append({
+                  "ruleId": f"npm-advisory-{source_id}",
+                  "level": severity_map.get(str(severity).lower(), 'warning'),
+                  "message": {"text": message},
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": package_json},
+                          "region": {"startLine": 1}
+                      }
+                  }]
+              })
+
+          def load_json_payloads(audit_file):
+              with open(audit_file, 'r') as f:
+                  raw = f.read().strip()
+              if not raw:
+                  return []
+              try:
+                  return [json.loads(raw)]
+              except Exception:
+                  payloads = []
+                  for line in raw.splitlines():
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          payloads.append(json.loads(line))
+                      except Exception:
+                          continue
+                  return payloads
+
+          def source_entries():
+              manifest = 'npm-audit-manifest.txt'
+              if os.path.exists(manifest):
+                  with open(manifest, 'r') as f:
+                      for line in f:
+                          line = line.strip()
+                          if not line:
+                              continue
+                          parts = line.split('|', 2)
+                          if len(parts) == 3:
+                              yield parts[0], parts[1], parts[2]
+              else:
+                  for audit_file in glob.glob('npm-audit-*.json'):
+                      yield 'npm', '.', audit_file
+
+          try:
+              for _pm, dir_part, audit_file in source_entries():
+                  package_json = f"{dir_part}/package.json" if dir_part not in ('.', '') else 'package.json'
+
+                  for data in load_json_payloads(audit_file):
+                      if not isinstance(data, dict):
+                          continue
+
+                      # npm v7+ format
+                      vulnerabilities = data.get('vulnerabilities', {})
+                      if isinstance(vulnerabilities, dict) and vulnerabilities:
+                          for pkg_name, vuln_info in vulnerabilities.items():
+                              severity = vuln_info.get('severity', 'moderate')
+                              via = vuln_info.get('via', [])
+                              range_str = vuln_info.get('range', 'unknown')
+                              emitted = False
+
+                              if isinstance(via, list):
+                                  for v in via:
+                                      if isinstance(v, dict):
+                                          add_result(
+                                              package_json,
+                                              pkg_name,
+                                              severity,
+                                              v.get('title', 'Vulnerable dependency'),
+                                              v.get('url', ''),
+                                              str(v.get('source', 'unknown')),
+                                              range_str,
+                                          )
+                                          emitted = True
+
+                              if not emitted:
+                                  add_result(
+                                      package_json,
+                                      pkg_name,
+                                      severity,
+                                      'Vulnerable dependency',
+                                      '',
+                                      'unknown',
+                                      range_str,
+                                  )
+                          continue
+
+                      # npm/pnpm legacy advisories format
+                      advisories = data.get('advisories', {})
+                      if isinstance(advisories, dict) and advisories:
+                          for source_id, advisory in advisories.items():
+                              if not isinstance(advisory, dict):
+                                  continue
+                              add_result(
+                                  package_json,
+                                  advisory.get('module_name', 'unknown'),
+                                  advisory.get('severity', 'moderate'),
+                                  advisory.get('title', 'Vulnerable dependency'),
+                                  advisory.get('url', ''),
+                                  str(source_id),
+                                  advisory.get('vulnerable_versions', advisory.get('range', 'unknown')),
+                              )
+                          continue
+
+                      # Yarn classic JSON line format
+                      if data.get('type') == 'auditAdvisory':
+                          advisory = data.get('data', {}).get('advisory', {})
+                          if isinstance(advisory, dict):
+                              add_result(
+                                  package_json,
+                                  advisory.get('module_name', advisory.get('moduleName', 'unknown')),
+                                  advisory.get('severity', 'moderate'),
+                                  advisory.get('title', 'Vulnerable dependency'),
+                                  advisory.get('url', ''),
+                                  str(advisory.get('id', advisory.get('source', 'unknown'))),
+                                  advisory.get('vulnerable_versions', advisory.get('range', 'unknown')),
+                              )
+          except Exception as e:
+              raise SystemExit(f"Error processing npm/yarn/pnpm audit results: {e}")
+
+          with open('npm-audit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate npm-audit SARIF
+        if: always() && steps.check_js.outputs.has_js == 'true'
+        run: |
+          set -euo pipefail
+          [ -s npm-audit.sarif ] || { echo "::error::npm-audit.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('npm-audit.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-audit-sarif
+          path: npm-audit.sarif
+          retention-days: 1

@@ -1,0 +1,338 @@
+name: Rust Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: Cargo Audit (Rust)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Rust files
+        id: check_rust
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            if find . -name "Cargo.toml" | grep -q .; then
+              echo "has_rust=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all Rust files"
+            else
+              echo "has_rust=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.rs$|Cargo\.toml$|Cargo\.lock$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ] && find . -name "Cargo.toml" | grep -q .; then
+            echo "has_rust=true" >> $GITHUB_OUTPUT
+            echo "Rust files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_rust=false" >> $GITHUB_OUTPUT
+            echo "No Rust files changed in this PR"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.check_rust.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo registry
+        if: steps.check_rust.outputs.has_rust == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        if: steps.check_rust.outputs.has_rust == 'true'
+        run: for i in 1 2 3; do cargo install cargo-audit --version 0.22.1 --locked && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+
+      - name: Run cargo-audit
+        if: steps.check_rust.outputs.has_rust == 'true'
+        continue-on-error: true
+        run: |
+          cargo audit --json > cargo-audit.json
+
+      - name: Convert to SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+          import re
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "cargo-audit",
+                          "informationUri": "https://rustsec.org/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          # Build a map of package name -> Cargo.toml path
+          # Only match 'name' in [package] section to avoid workspace/dependency matches
+          import os
+          cargo_toml_map = {}
+          for root, dirs, files in os.walk('.'):
+              if 'Cargo.toml' in files:
+                  toml_path = os.path.join(root, 'Cargo.toml')
+                  try:
+                      with open(toml_path, 'r') as tf:
+                          in_package = False
+                          for tl in tf:
+                              stripped = tl.strip()
+                              if re.match(r'^\[package\]', stripped):
+                                  in_package = True
+                              elif re.match(r'^\[', stripped):
+                                  in_package = False
+                              elif in_package and stripped.startswith('name'):
+                                  pkg = stripped.split('=', 1)[-1].strip().strip('"').strip("'")
+                                  cargo_toml_map[pkg] = toml_path
+                                  break
+                  except Exception:
+                      pass
+          default_cargo_toml = cargo_toml_map.get(next(iter(cargo_toml_map), ''), 'Cargo.toml')
+
+          try:
+              with open('cargo-audit.json', 'r') as f:
+                  data = json.load(f)
+
+              vulnerabilities = data.get('vulnerabilities', {}).get('list', [])
+
+              for vuln in vulnerabilities:
+                  advisory = vuln.get('advisory', {})
+                  package = vuln.get('package', {})
+
+                  advisory_id = advisory.get('id', 'unknown')
+                  title = advisory.get('title', 'No description')
+                  cvss = advisory.get('cvss', None)
+                  pkg_name = package.get('name', 'unknown')
+                  pkg_version = package.get('version', 'unknown')
+                  url = advisory.get('url', '')
+
+                  if cvss:
+                      try:
+                          score = float(cvss)
+                      except (ValueError, TypeError):
+                          score = 7.0
+                      level = 'error' if score >= 7.0 else 'warning' if score >= 4.0 else 'note'
+                  else:
+                      level = 'warning'
+
+                  message = f"Vulnerable dependency: {pkg_name} {pkg_version} - {title}"
+                  if url:
+                      message += f". Advisory: {url}"
+
+                  cargo_toml = cargo_toml_map.get(pkg_name, default_cargo_toml)
+
+                  result = {
+                      "ruleId": advisory_id,
+                      "level": level,
+                      "message": {"text": message},
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": cargo_toml},
+                              "region": {"startLine": 1}
+                          }
+                      }]
+                  }
+                  sarif["runs"][0]["results"].append(result)
+
+          except Exception as e:
+              raise SystemExit(f"Error processing cargo-audit results: {e}")
+
+          with open('cargo-audit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate cargo-audit SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true'
+        run: |
+          set -euo pipefail
+          [ -s cargo-audit.sarif ] || { echo "::error::cargo-audit.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('cargo-audit.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cargo-audit-sarif
+          path: cargo-audit.sarif
+          retention-days: 1
+
+  clippy:
+    name: Clippy (Rust Linting)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Rust files
+        id: check_rust
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            if find . -name "Cargo.toml" -maxdepth 3 | grep -q .; then
+              echo "has_rust=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all Rust files"
+            else
+              echo "has_rust=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.rs$|Cargo\.toml$|Cargo\.lock$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ] && find . -name "Cargo.toml" -maxdepth 3 | grep -q .; then
+            echo "has_rust=true" >> $GITHUB_OUTPUT
+            echo "Rust files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_rust=false" >> $GITHUB_OUTPUT
+            echo "No Rust files changed in this PR"
+          fi
+
+      - name: Install Rust toolchain with clippy
+        if: steps.check_rust.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        if: steps.check_rust.outputs.has_rust == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+
+      - name: Run Clippy
+        if: steps.check_rust.outputs.has_rust == 'true'
+        continue-on-error: true
+        run: |
+          cargo clippy --all-targets --message-format=json 2>&1 | tee clippy.json
+
+      - name: Set up Python
+        if: steps.check_rust.outputs.has_rust == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Clippy",
+                          "informationUri": "https://rust-lang.github.io/rust-clippy/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('clippy.json', 'r') as f:
+                  for line in f:
+                      try:
+                          msg = json.loads(line.strip())
+                      except Exception:
+                          continue
+
+                      if msg.get('reason') != 'compiler-message':
+                          continue
+
+                      compiler_msg = msg.get('message', {})
+                      level_str = compiler_msg.get('level', 'warning')
+                      if level_str not in ('warning', 'error'):
+                          continue
+
+                      code = compiler_msg.get('code', {})
+                      rule_id = code.get('code', 'unknown') if code else 'unknown'
+                      message_text = compiler_msg.get('message', 'No description')
+
+                      level_map = {'error': 'error', 'warning': 'warning'}
+                      sarif_level = level_map.get(level_str, 'warning')
+
+                      spans = compiler_msg.get('spans', [])
+                      primary_span = next((s for s in spans if s.get('is_primary')), spans[0] if spans else None)
+
+                      if primary_span:
+                          filepath = primary_span.get('file_name', 'unknown')
+                          start_line = primary_span.get('line_start', 1)
+                          start_col = primary_span.get('column_start', 1)
+                      else:
+                          filepath = 'unknown'
+                          start_line = 1
+                          start_col = 1
+
+                      result = {
+                          "ruleId": rule_id,
+                          "level": sarif_level,
+                          "message": {"text": message_text},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": start_line, "startColumn": start_col}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing Clippy results: {e}")
+
+          with open('clippy.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate Clippy SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true'
+        run: |
+          set -euo pipefail
+          [ -s clippy.sarif ] || { echo "::error::clippy.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('clippy.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clippy-sarif
+          path: clippy.sarif
+          retention-days: 1

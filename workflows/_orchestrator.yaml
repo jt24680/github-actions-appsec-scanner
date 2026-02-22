@@ -1,0 +1,469 @@
+name: Security Scanning
+on:
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      scanners:
+        description: 'Comma-separated list of scanners to run (or "all")'
+        required: false
+        default: 'all'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect Languages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      has_go: ${{ steps.check.outputs.has_go }}
+      has_rust: ${{ steps.check.outputs.has_rust }}
+      has_rails: ${{ steps.check.outputs.has_rails }}
+      has_sql: ${{ steps.check.outputs.has_sql }}
+      has_ps: ${{ steps.check.outputs.has_ps }}
+      has_dotnet: ${{ steps.check.outputs.has_dotnet }}
+      has_iac: ${{ steps.check.outputs.has_iac }}
+      has_python: ${{ steps.check.outputs.has_python }}
+      has_js: ${{ steps.check.outputs.has_js }}
+      has_java: ${{ steps.check.outputs.has_java }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed file types
+        id: check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          INPUT_SCANNERS: ${{ github.event.inputs.scanners || 'all' }}
+        run: |
+          # Helper: check if a scanner is selected via workflow_dispatch input
+          scanner_enabled() {
+            [ "$INPUT_SCANNERS" = "all" ] && return 0
+            echo ",$INPUT_SCANNERS," | grep -qi ",$1,"
+          }
+
+          # On workflow_dispatch there is no PR diff — enable selected scanners
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            FLAG_MAP="has_go:go has_rust:rust has_rails:rails has_sql:sql has_ps:powershell has_dotnet:dotnet has_iac:iac has_python:python has_js:js has_java:java"
+            for pair in $FLAG_MAP; do
+              flag="${pair%%:*}"
+              name="${pair##*:}"
+              if scanner_enabled "$name"; then
+                echo "$flag=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "$flag=false" >> "$GITHUB_OUTPUT"
+              fi
+            done
+            echo "workflow_dispatch — scanners input: $INPUT_SCANNERS"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # Go (include module/workspace file changes)
+          if echo "$CHANGED" | grep -qE '\.go$|go\.mod$|go\.sum$|go\.work$|go\.work\.sum$'; then
+            echo "has_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Rust (also requires Cargo.toml in the repo)
+          if echo "$CHANGED" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$' && find . -name "Cargo.toml" -maxdepth 3 | grep -q .; then
+            echo "has_rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Rails (requires Ruby file changes AND a Rails app)
+          if echo "$CHANGED" | grep -qE '\.(rb)$|(^|/)Gemfile$' && [ -f "config/application.rb" ]; then
+            echo "has_rails=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_rails=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # SQL
+          if echo "$CHANGED" | grep -qE '\.sql$'; then
+            echo "has_sql=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sql=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # PowerShell
+          if echo "$CHANGED" | grep -qE '\.(ps1|psm1|psd1)$'; then
+            echo "has_ps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # .NET
+          if echo "$CHANGED" | grep -qE '\.(csproj|fsproj|vbproj|sln|cs|fs|vb)$'; then
+            echo "has_dotnet=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dotnet=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # IaC (Terraform, Docker, K8s, CloudFormation, Helm)
+          if echo "$CHANGED" | grep -qE '\.tf$|(^|/)Dockerfile$|docker-compose\.ya?ml$|\.helmignore$|/helm/.*\.ya?ml$|k8s/.*\.ya?ml$|kubernetes/.*\.ya?ml$|cloudformation/.*\.ya?ml$|\.cfn\.ya?ml$'; then
+            echo "has_iac=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_iac=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Python
+          if echo "$CHANGED" | grep -qE '\.py$|requirements.*\.txt$|(^|/)Pipfile$|pyproject\.toml$|setup\.cfg$'; then
+            echo "has_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # JavaScript / TypeScript
+          if echo "$CHANGED" | grep -qE '\.(js|jsx|ts|tsx|mjs|cjs)$|package\.json$|yarn\.lock$|package-lock\.json$|pnpm-lock\.yaml$'; then
+            echo "has_js=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_js=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Java / Kotlin
+          if echo "$CHANGED" | grep -qE '\.(java|kt|kts)$|pom\.xml$|build\.gradle(\.kts)?$'; then
+            echo "has_java=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_java=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Language-specific scanners ──────────────────────────────────────
+
+  go:
+    needs: [detect]
+    if: needs.detect.outputs.has_go == 'true'
+    uses: ./.github/workflows/security-go.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  rust:
+    needs: [detect]
+    if: needs.detect.outputs.has_rust == 'true'
+    uses: ./.github/workflows/security-rust.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  python:
+    needs: [detect]
+    if: needs.detect.outputs.has_python == 'true'
+    uses: ./.github/workflows/security-python.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  js:
+    needs: [detect]
+    if: needs.detect.outputs.has_js == 'true'
+    uses: ./.github/workflows/security-js.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  java:
+    needs: [detect]
+    if: needs.detect.outputs.has_java == 'true'
+    uses: ./.github/workflows/security-java.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  dotnet:
+    needs: [detect]
+    if: needs.detect.outputs.has_dotnet == 'true'
+    uses: ./.github/workflows/security-dotnet.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  rails:
+    needs: [detect]
+    if: needs.detect.outputs.has_rails == 'true'
+    uses: ./.github/workflows/security-rails.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  sql:
+    needs: [detect]
+    if: needs.detect.outputs.has_sql == 'true'
+    uses: ./.github/workflows/security-sql.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  powershell:
+    needs: [detect]
+    if: needs.detect.outputs.has_ps == 'true'
+    uses: ./.github/workflows/security-powershell.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  iac:
+    needs: [detect]
+    if: needs.detect.outputs.has_iac == 'true'
+    uses: ./.github/workflows/security-iac.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  # ── Language-agnostic scanners (always run) ─────────────────────────
+
+  general:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/_security-general.yaml
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+
+  # ── Aggregate report ────────────────────────────────────────────────
+
+  report:
+    name: Aggregate Report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    needs: [detect, go, rust, python, js, java, dotnet, rails, sql, powershell, iac, general]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    steps:
+      - name: Verify scanner jobs completed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          # Check that at least one scanner job succeeded (not all skipped/failed)
+          # This guards against fork PRs that crash every scanner
+          SUCCEEDED=$(echo "$NEEDS_JSON" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          scanner_jobs = {k: v for k, v in needs.items() if k != 'detect'}
+          succeeded = [k for k, v in scanner_jobs.items() if v['result'] == 'success']
+          skipped = [k for k, v in scanner_jobs.items() if v['result'] == 'skipped']
+          failed = [k for k, v in scanner_jobs.items() if v['result'] == 'failure']
+          print(f'succeeded={len(succeeded)} skipped={len(skipped)} failed={len(failed)}')
+          # If every non-skipped scanner failed, flag it
+          non_skipped = [k for k, v in scanner_jobs.items() if v['result'] != 'skipped']
+          if non_skipped and all(needs[k]['result'] == 'failure' for k in non_skipped):
+              print('WARNING: All scanners failed — results may be unreliable')
+              with open('scanner_warning', 'w') as f:
+                  f.write('true')
+          ")
+          echo "$SUCCEEDED"
+
+      - name: Download all SARIF files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*-sarif*'
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate Summary
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+
+          MAX_COMMENT_SIZE = 60000  # Leave margin below GitHub's 65536 limit
+
+          def parse_sarif(filepath):
+              try:
+                  with open(filepath, 'r') as f:
+                      sarif = json.load(f)
+              except Exception as e:
+                  print(f"Warning: failed to parse {filepath}: {e}")
+                  return None, {'error': 0, 'warning': 0, 'note': 0}, []
+
+              counts = {'error': 0, 'warning': 0, 'note': 0}
+              tool_name = 'Unknown'
+              findings = []
+
+              for run in sarif.get('runs', []):
+                  tool_name = run.get('tool', {}).get('driver', {}).get('name', 'Unknown')
+
+                  for result in run.get('results', []):
+                      level = result.get('level', 'warning')
+                      if level in counts:
+                          counts[level] += 1
+
+                      rule_id = result.get('ruleId', 'unknown')
+                      message = result.get('message', {}).get('text', 'No description')
+
+                      location_info = 'unknown location'
+                      if result.get('locations'):
+                          phys_loc = result['locations'][0].get('physicalLocation', {})
+                          file_path = phys_loc.get('artifactLocation', {}).get('uri', 'unknown')
+                          region = phys_loc.get('region', {})
+                          start_line = region.get('startLine', 0)
+                          start_col = region.get('startColumn', 0)
+
+                          if start_line and start_col:
+                              location_info = f"{file_path}:{start_line}:{start_col}"
+                          elif start_line:
+                              location_info = f"{file_path}:{start_line}"
+                          else:
+                              location_info = file_path
+
+                      findings.append({
+                          'level': level,
+                          'rule': rule_id,
+                          'message': message,
+                          'location': location_info
+                      })
+
+              return tool_name, counts, findings
+
+          sarif_files = []
+          for root, dirs, files in os.walk('.'):
+              for file in files:
+                  if file.endswith('.sarif'):
+                      sarif_files.append(os.path.join(root, file))
+
+          results = {}
+          all_findings = {}
+
+          for filepath in sarif_files:
+              tool_name, counts, findings = parse_sarif(filepath)
+              if tool_name and tool_name != 'Unknown':
+                  # Accumulate counts for duplicate tool names instead of overwriting
+                  if tool_name in results:
+                      for level in counts:
+                          results[tool_name][level] += counts[level]
+                      all_findings[tool_name].extend(findings)
+                  else:
+                      results[tool_name] = counts
+                      all_findings[tool_name] = findings
+
+          # Check if all scanners failed (fork PR protection)
+          scanner_warning = os.path.exists('scanner_warning')
+
+          summary = "## 🔒 Security Scan Summary\n\n"
+
+          if scanner_warning:
+              summary += "⚠️ **Warning**: All scanner jobs failed. Results may be unreliable — review the [workflow run](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}) for details.\n\n"
+
+          if results:
+              summary += "| Tool | 🔴 High | 🟠 Medium | 🔵 Low | Total |\n"
+              summary += "|------|---------|-----------|--------|-------|\n"
+
+              grand_total = {'error': 0, 'warning': 0, 'note': 0}
+
+              for tool in sorted(results.keys()):
+                  counts = results[tool]
+                  total = sum(counts.values())
+                  summary += f"| {tool} | {counts['error']} | {counts['warning']} | {counts['note']} | **{total}** |\n"
+
+                  for level in grand_total:
+                      grand_total[level] += counts[level]
+
+              total_findings = sum(grand_total.values())
+              summary += f"| **Total** | **{grand_total['error']}** | **{grand_total['warning']}** | **{grand_total['note']}** | **{total_findings}** |\n\n"
+
+              if grand_total['error'] > 0:
+                  summary += "🔴 **Action Required**: High severity findings detected\n\n"
+              elif grand_total['warning'] > 0:
+                  summary += "🟠 **Review Recommended**: Medium severity findings detected\n\n"
+              else:
+                  summary += "✅ **No critical issues found**\n\n"
+
+              # Add detailed findings (limit to top 5 per tool to stay within size limit)
+              details = "<details>\n<summary>📋 Detailed Findings (Click to expand)</summary>\n\n"
+
+              for tool in sorted(all_findings.keys()):
+                  findings = all_findings[tool]
+                  high_findings = [f for f in findings if f['level'] == 'error']
+
+                  if high_findings:
+                      details += f"\n### {tool}\n\n"
+
+                      for finding in high_findings[:5]:
+                          details += f"- **{finding['rule']}**: {finding['message']}\n"
+                          details += f"  - 📍 `{finding['location']}`\n"
+
+                      if len(high_findings) > 5:
+                          details += f"\n*...and {len(high_findings) - 5} more high severity findings*\n"
+
+              details += "\n</details>\n"
+
+              # Only include details if within size limit
+              if len(summary) + len(details) < MAX_COMMENT_SIZE:
+                  summary += details
+
+              summary += f"\n---\n"
+              summary += f"[View Full Scan Results](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}})\n"
+          else:
+              summary += "No security findings detected.\n"
+
+          # Final size guard
+          if len(summary) > MAX_COMMENT_SIZE:
+              summary = summary[:MAX_COMMENT_SIZE] + "\n\n*... truncated due to size limit. See full results in the workflow run.*\n"
+
+          with open('security-summary.md', 'w') as f:
+              f.write(summary)
+
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as f:
+              f.write(summary)
+
+          print(summary)
+          EOF
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = fs.readFileSync('security-summary.md', 'utf8');
+            const marker = '<!-- security-scan-summary -->';
+
+            // Final size guard for GitHub API limit
+            const MAX_SIZE = 65536;
+            let body = `${marker}\n${summary}`;
+            if (body.length > MAX_SIZE) {
+              body = body.substring(0, MAX_SIZE - 100) + '\n\n*... truncated due to GitHub comment size limit.*';
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

@@ -1,0 +1,88 @@
+name: Rails Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  brakeman:
+    name: Brakeman (Rails Security)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Rails/Ruby files
+        id: check_rails
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            if [ -f "config/application.rb" ]; then
+              echo "has_rails=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all Rails files"
+            else
+              echo "has_rails=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.(rb)$|(^|/)Gemfile$' || echo "")
+
+          # Only run Brakeman if this is actually a Rails app (config/application.rb exists)
+          if [ -f "config/application.rb" ] && [ -n "$CHANGED_FILES" ]; then
+            echo "has_rails=true" >> $GITHUB_OUTPUT
+            echo "Rails/Ruby files changed in a Rails project"
+          else
+            echo "has_rails=false" >> $GITHUB_OUTPUT
+            echo "No Rails/Ruby files changed in this PR"
+          fi
+
+      - name: Set up Ruby
+        if: steps.check_rails.outputs.has_rails == 'true'
+        uses: ruby/setup-ruby@09a7688d3b55cf0e976497ff046b70949eeaccfd # v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+
+      - name: Cache Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.gem
+          key: ${{ runner.os }}-gems-brakeman-${{ hashFiles('**/Gemfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gems-brakeman-
+
+      - name: Install Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true'
+        run: for i in 1 2 3; do gem install brakeman -v 8.0.2 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+
+      - name: Run Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true'
+        continue-on-error: true
+        run: |
+          brakeman --format sarif --output brakeman.sarif --no-pager --quiet
+
+      - name: Validate Brakeman SARIF
+        if: always() && steps.check_rails.outputs.has_rails == 'true'
+        run: |
+          set -euo pipefail
+          [ -s brakeman.sarif ] || { echo "::error::brakeman.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('brakeman.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: brakeman-sarif
+          path: brakeman.sarif
+          retention-days: 1

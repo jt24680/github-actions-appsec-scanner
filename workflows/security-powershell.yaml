@@ -1,0 +1,134 @@
+name: PowerShell Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    name: PowerShell Analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed PowerShell files
+        id: check_ps
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            find . \( -name '*.ps1' -o -name '*.psm1' -o -name '*.psd1' \) -not -path './.git/*' > changed_ps_files.txt
+            if [ -s changed_ps_files.txt ]; then
+              echo "has_ps=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all PowerShell files"
+            else
+              echo "has_ps=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.(ps1|psm1|psd1)$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_ps=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_ps_files.txt
+            echo "PowerShell files changed:"
+            cat changed_ps_files.txt
+          else
+            echo "has_ps=false" >> $GITHUB_OUTPUT
+            echo "No PowerShell files changed in this PR"
+          fi
+
+      - name: Cache PSScriptAnalyzer
+        if: steps.check_ps.outputs.has_ps == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.local/share/powershell/Modules
+          key: ${{ runner.os }}-psmodules-${{ hashFiles('.github/workflows/security-powershell.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-psmodules-
+
+      - name: Run PSScriptAnalyzer
+        if: steps.check_ps.outputs.has_ps == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $maxAttempts = 3
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            try { Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.23.0 -Force -Scope CurrentUser -ErrorAction Stop; break }
+            catch { Write-Host "Attempt $i/$maxAttempts failed: $_"; if ($i -lt $maxAttempts) { Start-Sleep -Seconds 10 } else { throw } }
+          }
+          $changedFiles = Get-Content 'changed_ps_files.txt' | Where-Object { $_ -ne '' }
+          $results = @()
+          foreach ($file in $changedFiles) {
+            if (Test-Path $file) {
+              $results += Invoke-ScriptAnalyzer -Path $file -Severity Error,Warning,Information
+            }
+          }
+          $workDir = (Get-Location).Path + [IO.Path]::DirectorySeparatorChar
+
+          $sarif = @{
+            '$schema' = 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json'
+            version = '2.1.0'
+            runs = @(@{
+              tool = @{
+                driver = @{
+                  name = 'PSScriptAnalyzer'
+                  version = '1.23.0'
+                }
+              }
+              results = @()
+            })
+          }
+
+          foreach ($result in $results) {
+            $level = switch ($result.Severity) {
+              'Error' { 'error' }
+              'Warning' { 'warning' }
+              'Information' { 'note' }
+              default { 'note' }
+            }
+
+            $relativePath = $result.ScriptPath
+            if ($relativePath.StartsWith($workDir)) {
+              $relativePath = $relativePath.Substring($workDir.Length)
+            }
+
+            $sarif.runs[0].results += @{
+              ruleId = $result.RuleName
+              level = $level
+              message = @{ text = $result.Message }
+              locations = @(@{
+                physicalLocation = @{
+                  artifactLocation = @{ uri = $relativePath }
+                  region = @{ startLine = $result.Line }
+                }
+              })
+            }
+          }
+
+          $sarif | ConvertTo-Json -Depth 10 | Out-File -FilePath powershell.sarif
+
+      - name: Validate PowerShell SARIF
+        if: always() && steps.check_ps.outputs.has_ps == 'true'
+        run: |
+          set -euo pipefail
+          [ -s powershell.sarif ] || { echo "::error::powershell.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('powershell.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: powershell-sarif
+          path: powershell.sarif
+          retention-days: 1

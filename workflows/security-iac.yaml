@@ -1,0 +1,79 @@
+name: IaC Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  checkov:
+    name: Checkov IaC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed IaC files
+        id: check_iac
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_iac=true" >> $GITHUB_OUTPUT
+            echo "No PR context — scanning all IaC files"
+            exit 0
+          fi
+          # Match Terraform, Dockerfiles, Kubernetes manifests, CloudFormation, Helm, and compose files
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.tf$|(^|/)Dockerfile$|docker-compose\.ya?ml$|\.helmignore$|/helm/.*\.ya?ml$|k8s/.*\.ya?ml$|kubernetes/.*\.ya?ml$|cloudformation/.*\.ya?ml$|\.cfn\.ya?ml$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_iac=true" >> $GITHUB_OUTPUT
+            echo "IaC files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_iac=false" >> $GITHUB_OUTPUT
+            echo "No IaC files changed in this PR"
+          fi
+
+      - name: Run Checkov
+        if: steps.check_iac.outputs.has_iac == 'true'
+        uses: bridgecrewio/checkov-action@05d9f3cd4807c3dea7444d4e60dc44ad57928ab5
+        with:
+          directory: .
+          framework: all
+          output_format: sarif
+          output_file_path: ./
+          soft_fail_on: LOW,MEDIUM
+          hard_fail_on: HIGH,CRITICAL
+
+      - name: Rename Checkov output
+        if: always() && steps.check_iac.outputs.has_iac == 'true'
+        run: |
+          if [ -f "results_sarif.sarif" ]; then
+            mv results_sarif.sarif checkov.sarif
+          elif [ -f "results.sarif" ]; then
+            mv results.sarif checkov.sarif
+          fi
+
+      - name: Validate Checkov SARIF
+        if: always() && steps.check_iac.outputs.has_iac == 'true'
+        run: |
+          set -euo pipefail
+          [ -s checkov.sarif ] || { echo "::error::checkov.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('checkov.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checkov-sarif
+          path: checkov.sarif
+          retention-days: 1

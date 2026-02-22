@@ -1,0 +1,107 @@
+name: Java/Kotlin Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  pmd:
+    name: PMD (Java/Kotlin Security)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Java/Kotlin files
+        id: check_java
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            # On workflow_dispatch, find all Java/Kotlin files
+            find . \( -name '*.java' -o -name '*.kt' -o -name '*.kts' \) -not -path './.git/*' > changed_java_files.txt
+            if [ -s changed_java_files.txt ]; then
+              echo "has_java=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all Java/Kotlin files"
+            else
+              echo "has_java=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.(java|kt|kts)$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_java=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_java_files.txt
+            echo "Java/Kotlin files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_java=false" >> $GITHUB_OUTPUT
+            echo "No Java/Kotlin files changed in this PR"
+          fi
+
+      - name: Set up Java
+        if: steps.check_java.outputs.has_java == 'true'
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache PMD
+        if: steps.check_java.outputs.has_java == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/pmd
+          key: ${{ runner.os }}-pmd-7.12.0
+          restore-keys: |
+            ${{ runner.os }}-pmd-
+
+      - name: Install PMD
+        if: steps.check_java.outputs.has_java == 'true'
+        run: |
+          if [ ! -f ~/pmd/bin/pmd ]; then
+            PMD_SHA256="d679c04f4e6e14e82660bfdc25127e4a3efe68be1e0d53ab6e80fbb0b6e1a8c0"
+            for i in 1 2 3; do
+              curl -sSL "https://github.com/pmd/pmd/releases/download/pmd_releases%2F7.12.0/pmd-dist-7.12.0-bin.zip" -o pmd.zip && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }
+            done
+            echo "$PMD_SHA256  pmd.zip" | sha256sum -c - || { echo "Checksum verification failed!"; exit 1; }
+            unzip -q pmd.zip -d ~/
+            mv ~/pmd-bin-7.12.0 ~/pmd
+          fi
+
+      - name: Run PMD
+        if: steps.check_java.outputs.has_java == 'true'
+        continue-on-error: true
+        run: |
+          # Build comma-separated file list for PMD
+          FILE_LIST=$(tr '\n' ',' < changed_java_files.txt | sed 's/,$//')
+          ~/pmd/bin/pmd check \
+            -d "$FILE_LIST" \
+            -R rulesets/java/quickstart.xml \
+            -f sarif \
+            --no-progress \
+            > pmd.sarif 2>/dev/null || true
+
+      - name: Validate PMD SARIF
+        if: always() && steps.check_java.outputs.has_java == 'true'
+        run: |
+          set -euo pipefail
+          [ -s pmd.sarif ] || { echo "::error::pmd.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('pmd.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pmd-sarif
+          path: pmd.sarif
+          retention-days: 1

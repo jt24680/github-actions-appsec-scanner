@@ -1,0 +1,307 @@
+name: Python Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bandit:
+    name: Bandit (Python SAST)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changed Python files
+        id: check_python
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            find . -name '*.py' -not -path './.git/*' -not -path '*/node_modules/*' > changed_python_files.txt
+            if [ -s changed_python_files.txt ]; then
+              echo "has_python=true" >> $GITHUB_OUTPUT
+              echo "No PR context — scanning all Python files"
+            else
+              echo "has_python=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E '\.py$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_python=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > changed_python_files.txt
+            echo "Python files changed:"
+            cat changed_python_files.txt
+          else
+            echo "has_python=false" >> $GITHUB_OUTPUT
+            echo "No Python files changed in this PR"
+          fi
+
+      - name: Set up Python
+        if: steps.check_python.outputs.has_python == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Bandit
+        if: steps.check_python.outputs.has_python == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-bandit-${{ hashFiles('.github/workflows/security-python.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-bandit-
+
+      - name: Install Bandit
+        if: steps.check_python.outputs.has_python == 'true'
+        run: for i in 1 2 3; do pip install bandit==1.8.3 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+
+      - name: Run Bandit
+        if: steps.check_python.outputs.has_python == 'true'
+        continue-on-error: true
+        run: |
+          xargs -d '\n' bandit -r -f json -o bandit.json < changed_python_files.txt || true
+
+      - name: Convert to SARIF
+        if: always() && steps.check_python.outputs.has_python == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Bandit",
+                          "version": "1.8.3",
+                          "informationUri": "https://bandit.readthedocs.io/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('bandit.json', 'r') as f:
+                  data = json.load(f)
+
+              severity_map = {
+                  'HIGH': 'error',
+                  'MEDIUM': 'warning',
+                  'LOW': 'note'
+              }
+
+              for result in data.get('results', []):
+                  test_id = result.get('test_id', 'unknown')
+                  test_name = result.get('test_name', '')
+                  severity = result.get('issue_severity', 'MEDIUM')
+                  confidence = result.get('issue_confidence', 'MEDIUM')
+                  issue_text = result.get('issue_text', 'No description')
+                  filename = result.get('filename', 'unknown')
+                  line_number = result.get('line_number', 1)
+                  col_offset = result.get('col_offset', 1)
+
+                  message = f"[{test_id}:{test_name}] {issue_text} (severity: {severity}, confidence: {confidence})"
+
+                  sarif_result = {
+                      "ruleId": test_id,
+                      "level": severity_map.get(severity, 'warning'),
+                      "message": {"text": message},
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": filename},
+                              "region": {"startLine": line_number, "startColumn": col_offset or 1}
+                          }
+                      }]
+                  }
+                  sarif["runs"][0]["results"].append(sarif_result)
+          except Exception as e:
+              raise SystemExit(f"Error processing Bandit results: {e}")
+
+          with open('bandit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate Bandit SARIF
+        if: always() && steps.check_python.outputs.has_python == 'true'
+        run: |
+          set -euo pipefail
+          [ -s bandit.sarif ] || { echo "::error::bandit.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('bandit.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bandit-sarif
+          path: bandit.sarif
+          retention-days: 1
+
+  pip-audit:
+    name: pip-audit (Python Dependencies)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for dependency file changes
+        id: check_deps
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_deps=true" >> $GITHUB_OUTPUT
+            echo "No PR context — auditing all requirements files"
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA" | grep -E 'requirements.*\.txt$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_deps=true" >> $GITHUB_OUTPUT
+            echo "Python dependency files changed:"
+            echo "$CHANGED_FILES"
+          else
+            echo "has_deps=false" >> $GITHUB_OUTPUT
+            echo "No Python dependency files changed in this PR"
+          fi
+
+      - name: Set up Python
+        if: steps.check_deps.outputs.has_deps == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip-audit
+        if: steps.check_deps.outputs.has_deps == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-audit-${{ hashFiles('.github/workflows/security-python.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-audit-
+
+      - name: Install pip-audit
+        if: steps.check_deps.outputs.has_deps == 'true'
+        run: for i in 1 2 3; do pip install pip-audit==2.9.0 && break || { echo "Attempt $i/3 failed, retrying in 10s..."; sleep 10; }; done
+
+      - name: Run pip-audit
+        if: steps.check_deps.outputs.has_deps == 'true'
+        continue-on-error: true
+        run: |
+          # Find and audit all requirements files, aggregating via file I/O
+          echo '[]' > pip-audit-aggregated.json
+          for req_file in $(find . -maxdepth 3 -name 'requirements*.txt' -not -path './.git/*'); do
+            echo "Auditing $req_file..."
+            pip-audit -r "$req_file" --format json --output pip-audit-partial.json 2>/dev/null || true
+            if [ -f pip-audit-partial.json ]; then
+              REQ_FILE="$req_file" python3 << 'PYEOF'
+          import json, os
+          with open('pip-audit-aggregated.json') as f:
+              existing = json.load(f)
+          with open('pip-audit-partial.json') as f:
+              new = json.load(f)
+          deps = new.get('dependencies', []) if isinstance(new, dict) else new
+          source = os.environ['REQ_FILE']
+          for dep in deps:
+              dep['_source_file'] = source
+          existing.extend(deps)
+          with open('pip-audit-aggregated.json', 'w') as f:
+              json.dump(existing, f)
+          PYEOF
+              rm -f pip-audit-partial.json
+            fi
+          done
+          mv pip-audit-aggregated.json pip-audit.json
+
+      - name: Convert to SARIF
+        if: always() && steps.check_deps.outputs.has_deps == 'true'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "pip-audit",
+                          "version": "2.9.0",
+                          "informationUri": "https://pypi.org/project/pip-audit/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('pip-audit.json', 'r') as f:
+                  deps = json.load(f)
+
+              for dep in deps:
+                  vulns = dep.get('vulns', [])
+                  if not vulns:
+                      continue
+
+                  pkg_name = dep.get('name', 'unknown')
+                  pkg_version = dep.get('version', 'unknown')
+                  source_file = dep.get('_source_file', 'requirements.txt')
+
+                  for vuln in vulns:
+                      vuln_id = vuln.get('id', 'unknown')
+                      fix_versions = vuln.get('fix_versions', [])
+                      description = vuln.get('description', 'Vulnerable dependency detected')
+
+                      message = f"Vulnerable package: {pkg_name}=={pkg_version} ({vuln_id})"
+                      if fix_versions:
+                          message += f". Fix available: {', '.join(fix_versions)}"
+
+                      result = {
+                          "ruleId": vuln_id,
+                          "level": "error",
+                          "message": {"text": message},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": source_file},
+                                  "region": {"startLine": 1}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing pip-audit results: {e}")
+
+          with open('pip-audit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate pip-audit SARIF
+        if: always() && steps.check_deps.outputs.has_deps == 'true'
+        run: |
+          set -euo pipefail
+          [ -s pip-audit.sarif ] || { echo "::error::pip-audit.sarif was not generated. Scanner may have crashed."; exit 1; }
+          python3 -c "import json; data=json.load(open('pip-audit.sarif')); assert isinstance(data.get('runs'), list)"
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pip-audit-sarif
+          path: pip-audit.sarif
+          retention-days: 1
