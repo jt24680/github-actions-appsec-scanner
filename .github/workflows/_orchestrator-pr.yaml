@@ -1,0 +1,36 @@
+name: "Security Scanning: PR"
+# Least-privilege PR workflow. Only grants pull-requests: write (for PR comments
+# and dependency-review). Does NOT grant security-events: write.
+# Pair with _orchestrator-ci.yaml for push/schedule/dispatch events.
+on:
+  pull_request:
+    branches: [ main, develop ]  # Only PRs targeting these branches trigger scans.
+                                  # Feature-branch pushes are not scanned unless they open a PR here.
+
+concurrency:
+  # Cancels the in-progress scan if a new commit is pushed to the same PR.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# LEAST PRIVILEGE: Only the permissions actually needed for PR events.
+# pull-requests: write — PR comment (report job) + dependency-review comment-summary-in-pr.
+# security-events: write is NOT granted — Code Scanning upload is disabled.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  orchestrate:
+    name: Orchestrate Security Scans
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/orchestrator-reusable.yaml
+    secrets:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+      scanners: 'all'
+      enable_pr_comment: true
+      enable_code_scanning_upload: false  # Not granted — use _orchestrator-ci.yaml for Code Scanning.

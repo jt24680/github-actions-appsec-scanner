@@ -1,0 +1,402 @@
+name: SQL Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_sqlfluff:
+        type: boolean
+        default: true
+      enable_tsqllint:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  sqlfluff:
+    name: SQLFluff
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Get changed SQL files
+        id: check_sql
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_sql_files.txt
+          label: SQL
+          include-regex: '\.sql$'
+          exclude-regex: '(^|/)node_modules/|(^|/)vendor/'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      # When the orchestrator routes us on config-only changes (.sqlfluff, .sqlfluffignore),
+      # collect-paths finds no .sql files. Fall back to scanning all tracked .sql files
+      # since config changes affect the entire scan.
+      - name: Config-only fallback
+        id: config_fallback
+        if: steps.check_sql.outputs.has_files == 'false'
+        run: |
+          git ls-files -z '*.sql' > changed_sql_files.txt || true
+          if [ -s changed_sql_files.txt ]; then
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::SQL config changed — scanning all tracked SQL files"
+          else
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SQLFluff disabled
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && !inputs.enable_sqlfluff
+        run: |
+          echo '::notice title=Tool Disabled::SQLFluff is disabled. Set enable_sqlfluff: true to re-enable.'
+
+      - name: Set up Python
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache SQLFluff
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-sqlfluff-${{ hashFiles('.github/workflows/security-sql.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-sqlfluff-
+
+      - name: Install SQLFluff
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        run: |
+          for i in 1 2 3; do
+            pip install sqlfluff==4.0.4 sqlfluff-templater-dbt==4.0.4 && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install SQLFluff after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run SQLFluff
+        id: run_sqlfluff
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        continue-on-error: true
+        run: |
+          # Process files in batches to avoid ARG_MAX limits on large repos.
+          # Each batch writes to a numbered temp file; results are merged afterward.
+          # 'ansi' is the most portable dialect but may miss dialect-specific rules.
+          # Change to 'tsql', 'postgres', 'mysql', etc. if the codebase targets a specific engine.
+          mkdir -p "$RUNNER_TEMP/sqlfluff-parts"
+          mkdir -p "$RUNNER_TEMP/sqlfluff-results"
+          BATCH=0
+          BATCH_SIZE=0
+          while IFS= read -r -d '' line; do
+            BATCH_FILE="$RUNNER_TEMP/sqlfluff-parts/batch_${BATCH}.txt"
+            printf '%s\0' "$line" >> "$BATCH_FILE"
+            BATCH_SIZE=$((BATCH_SIZE + 1))
+            if [ "$BATCH_SIZE" -ge 500 ]; then
+              BATCH=$((BATCH + 1))
+              BATCH_SIZE=0
+            fi
+          done < changed_sql_files.txt
+
+          for batch in "$RUNNER_TEMP"/sqlfluff-parts/batch_*.txt; do
+            [ -e "$batch" ] || continue
+            IDX=$(basename "$batch" .txt)
+            xargs -0 sqlfluff lint --format json --dialect ansi -- < "$batch" > "$RUNNER_TEMP/sqlfluff-results/${IDX}.json" || true
+          done
+
+          # Merge all batch results into a single valid JSON array.
+          python3 -c "
+          import json, glob, sys, os
+          results_dir = os.path.join(os.environ['RUNNER_TEMP'], 'sqlfluff-results')
+          files = sorted(glob.glob(os.path.join(results_dir, '*.json')))
+          if not files:
+              print('::warning::No SQLFluff output files found — scanner may have failed')
+              sys.exit(1)
+          merged = []
+          drop_count = 0
+          for f in files:
+              try:
+                  with open(f) as fh:
+                      merged.extend(json.load(fh))
+              except (json.JSONDecodeError, TypeError) as e:
+                  drop_count += 1
+                  print(f'::warning::Failed to parse SQLFluff batch {f}: {e}')
+          if drop_count > 0:
+              print(f'::warning::{drop_count} SQLFluff batch(es) failed to parse')
+          if drop_count == len(files):
+              print('::error::All SQLFluff batches failed to parse')
+              sys.exit(1)
+          with open('sqlfluff.json', 'w') as fh:
+              json.dump(merged, fh, indent=2)
+          "
+
+      - name: Check SQLFluff result
+        if: steps.run_sqlfluff.outcome == 'failure'
+        run: echo "::warning title=SQLFluff::SQLFluff exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: always() && steps.run_sqlfluff.outcome != 'failure' && (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "SQLFluff",
+                          "version": "4.0.4",
+                          "informationUri": "https://www.sqlfluff.com/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('sqlfluff.json', 'r') as f:
+                  data = json.load(f)
+
+              for file_entry in data:
+                  filepath = file_entry.get('filepath', 'unknown')
+                  for violation in file_entry.get('violations', []):
+                      rule_code = violation.get('code', 'unknown')
+                      description = violation.get('description', 'No description')
+                      line = violation.get('start_line_no', violation.get('line_no', 1))
+                      col = violation.get('start_line_pos', violation.get('line_pos', 1))
+
+                      # SQLFluff 4.x rule prefixes: LT/CV = layout/convention (style) → note;
+                      # AM/ST/RF/JJ/CP = anti-patterns, structure, references (logic) → warning.
+                      prefix = rule_code[:2] if len(rule_code) >= 2 else ''
+                      if prefix in ('LT', 'CV'):
+                          level = 'note'
+                      elif prefix in ('AM', 'ST', 'RF', 'JJ', 'CP'):
+                          level = 'warning'
+                      else:
+                          level = 'warning'
+
+                      result = {
+                          "ruleId": rule_code,
+                          "level": level,
+                          "message": {"text": description},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": line, "startColumn": col}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing SQLFluff results: {e}")
+
+          with open('sqlfluff.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate SQLFluff SARIF
+        if: always() && (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        run: |
+          set -euo pipefail
+          [ -s sqlfluff.sarif ] || { echo "::error::sqlfluff.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('sqlfluff.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::sqlfluff produced {n} finding(s)' if n else '::notice::sqlfluff completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_sqlfluff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sqlfluff-sarif
+          path: sqlfluff.sarif
+          retention-days: 7
+
+  tsqllint:
+    name: TSQLLint
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Get changed SQL files
+        id: check_sql
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_sql_files.txt
+          label: SQL
+          include-regex: '\.sql$'
+          exclude-regex: '(^|/)node_modules/|(^|/)vendor/'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      # When the orchestrator routes us on config-only changes (.sqlfluff, .sqlfluffignore),
+      # collect-paths finds no .sql files. Fall back to scanning all tracked .sql files.
+      - name: Config-only fallback
+        id: config_fallback
+        if: steps.check_sql.outputs.has_files == 'false'
+        run: |
+          git ls-files -z '*.sql' > changed_sql_files.txt || true
+          if [ -s changed_sql_files.txt ]; then
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::SQL config changed — scanning all tracked SQL files"
+          else
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: TSQLLint disabled
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && !inputs.enable_tsqllint
+        run: |
+          echo '::notice title=Tool Disabled::TSQLLint is disabled. Set enable_tsqllint: true to re-enable.'
+
+      - name: Set up .NET
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache .NET tools
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.dotnet/tools
+          key: ${{ runner.os }}-dotnet-tools-tsqllint-1.16.0
+
+      - name: Install TSQLLint
+        # TSQLLint is T-SQL specific (Microsoft SQL Server dialect). It runs alongside SQLFluff
+        # to catch T-SQL patterns that the generic ANSI dialect scanner may miss.
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        run: |
+          # Update if already present (e.g. from a warm cache), install fresh otherwise.
+          if dotnet tool list --global | grep -Eiq '^[[:space:]]*TSQLLint[[:space:]]'; then
+            echo "TSQLLint already installed — updating to 1.16.0"
+            for i in 1 2 3; do
+              dotnet tool update --global TSQLLint --version 1.16.0 && break
+              [ "$i" -lt 3 ] || { echo "::error::Failed to update TSQLLint after 3 attempts"; exit 1; }
+              echo "Attempt $i/3 failed, retrying in 10s..."
+              sleep 10
+            done
+          else
+            for i in 1 2 3; do
+              dotnet tool install --global TSQLLint --version 1.16.0 && break
+              [ "$i" -lt 3 ] || { echo "::error::Failed to install TSQLLint after 3 attempts"; exit 1; }
+              echo "Attempt $i/3 failed, retrying in 10s..."
+              sleep 10
+            done
+          fi
+          # Verify TSQLLint version after install/cache-restore to detect cache poisoning
+          TSQLLINT_VER=$(~/.dotnet/tools/tsqllint --version 2>/dev/null || echo "unknown")
+          if ! echo "$TSQLLINT_VER" | grep -qE '^[[:space:]]*1\.16\.'; then
+            echo "::error::TSQLLint version mismatch: expected 1.16.0, got $TSQLLINT_VER"
+            exit 1
+          fi
+
+      - name: Run TSQLLint
+        id: run_tsqllint
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        continue-on-error: true
+        run: |
+          xargs -0 ~/.dotnet/tools/tsqllint -- < changed_sql_files.txt > tsqllint.txt
+
+      - name: Check TSQLLint result
+        if: steps.run_tsqllint.outcome == 'failure'
+        run: echo "::warning title=TSQLLint::TSQLLint exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        if: (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.run_tsqllint.outcome != 'failure' && (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        run: |
+          python3 << 'EOF'
+          import json
+          import re
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TSQLLint",
+                          "version": "1.16.0",
+                          "informationUri": "https://github.com/tsqllint/tsqllint"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('tsqllint.txt', 'r') as f:
+                  lines = f.readlines()
+
+              pattern = r'(.+?)\((\d+),(\d+)\)\s*:\s*(error|warning|information)\s+(\S+)\s*:\s*(.+)'
+
+              for line in lines:
+                  match = re.match(pattern, line, re.IGNORECASE)
+                  if match:
+                      filepath, line_num, col_num, level, code, message = match.groups()
+
+                      level_map = {'error': 'error', 'warning': 'warning', 'information': 'note'}
+                      sarif_level = level_map.get(level.lower(), 'warning')
+
+                      result = {
+                          "ruleId": code,
+                          "level": sarif_level,
+                          "message": {"text": message.strip()},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": int(line_num), "startColumn": int(col_num)}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing TSQLLint results: {e}")
+
+          with open('tsqllint.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate TSQLLint SARIF
+        if: always() && (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        run: |
+          set -euo pipefail
+          [ -s tsqllint.sarif ] || { echo "::error::tsqllint.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('tsqllint.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::tsqllint produced {n} finding(s)' if n else '::notice::tsqllint completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && (steps.check_sql.outputs.has_files == 'true' || steps.config_fallback.outputs.has_files == 'true') && inputs.enable_tsqllint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tsqllint-sarif
+          path: tsqllint.sarif
+          retention-days: 7

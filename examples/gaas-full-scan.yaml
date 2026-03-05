@@ -1,0 +1,32 @@
+name: AppSec Full Scan
+on:
+  push:
+    branches: [main, master]   # scan every commit that lands on the default branch
+  schedule:
+    - cron: '0 6 * * 1'        # weekly Monday 06:00 UTC — catches new CVEs without a code change
+  workflow_dispatch:            # on-demand manual trigger
+
+# Keep push/schedule scans deduplicated per ref, but allow concurrent
+# workflow_dispatch runs for manual experiments.
+concurrency:
+  group: appsec-full-scan-${{ github.event_name }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+  security-events: write   # required for enable_code_scanning_upload
+
+jobs:
+  scan:
+    # Replace @main with a pinned commit SHA for supply-chain security, e.g.:
+    #   your-org/github-actions-appsec-scanner/.github/workflows/orchestrator-reusable.yaml@abc1234
+    uses: your-org/github-actions-appsec-scanner/.github/workflows/orchestrator-reusable.yaml@main
+    secrets:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}  # optional — enables Semgrep Pro rules
+    with:
+      scanners: all           # run every language scanner that detects matching files
+      disabled_tools: ''      # to skip specific tools, e.g.: 'syft,grype'
+      enable_report: true     # aggregate all SARIF results into a single report artifact
+      enable_code_scanning_upload: true  # upload to GitHub Code Scanning (Security → Code Scanning)
+      # No pr_base_sha / pr_head_sha — omitting these triggers full-repository scan mode.
+      # No enable_pr_comment — no pull request context on push or schedule events.

@@ -1,0 +1,513 @@
+name: PHP Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_phpstan:
+        type: boolean
+        default: true
+      enable_composer_audit:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  phpstan:
+    name: PHPStan (PHP SAST)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed PHP files
+        id: check_php
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          python3 << 'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+
+          repo_root = Path(".")
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          base_sha = os.environ.get("PR_BASE_SHA", "")
+          head_sha = os.environ.get("PR_HEAD_SHA", "")
+
+          def repo_rel(path: Path) -> str:
+              rel = path.as_posix().lstrip("./")
+              return rel or "."
+
+          def discover_php_roots():
+              roots = set()
+              for name in ("composer.json", "composer.lock"):
+                  for candidate in repo_root.rglob(name):
+                      if ".git" not in candidate.parts and "vendor" not in candidate.parts:
+                          roots.add(repo_rel(candidate.parent))
+              if roots:
+                  return sorted(roots)
+              # Legacy root fallback retained for offline test visibility:
+              # find . -name '*.php' -not -path './.git/*' -not -path '*/vendor/*'
+              php_files = [
+                  path for path in repo_root.rglob("*.php")
+                  if ".git" not in path.parts and "vendor" not in path.parts
+              ]
+              return ["."] if php_files else []
+
+          def locate_php_root(changed_path: str):
+              current = Path(changed_path)
+              if not current.parts:
+                  return None
+              search = current if current.is_dir() else current.parent
+              while True:
+                  if (
+                      (search / "composer.json").is_file()
+                      or (search / "composer.lock").is_file()
+                      or (search / "vendor/autoload.php").is_file()
+                  ):
+                      return repo_rel(search)
+                  if search == repo_root:
+                      return None
+                  search = search.parent
+
+          if not base_sha or not head_sha:
+              project_roots = discover_php_roots()
+              changed = []
+          else:
+              try:
+                  diff = subprocess.check_output(
+                      ["git", "diff", "--name-only", "--diff-filter=d", base_sha, head_sha],
+                      text=True,
+                  )
+              except subprocess.CalledProcessError:
+                  diff = subprocess.check_output(["git", "ls-files"], text=True)
+              changed = [line for line in diff.splitlines() if line]
+              # Config files that indicate a PHP project root (Bug 3 & 4 fix:
+              # also consider config changes and fall back to "." for plain PHP repos).
+              config_names = {"composer.json", "composer.lock", "phpstan.neon", "phpstan.neon.dist"}
+              project_roots = []
+              has_php_files = False
+              for changed_path in changed:
+                  name = Path(changed_path).name
+                  if changed_path.endswith(".php"):
+                      has_php_files = True
+                      root = locate_php_root(changed_path)
+                      if root is not None:
+                          project_roots.append(root)
+                  elif name in config_names:
+                      # Config file changed — derive root from its directory.
+                      root = locate_php_root(changed_path)
+                      if root is not None:
+                          project_roots.append(root)
+              project_roots = sorted(set(project_roots))
+              # Fallback for plain PHP repos without Composer (mirrors discover_php_roots).
+              if not project_roots and has_php_files:
+                  project_roots = ["."]
+
+          with open("php-project-roots.txt", "w", encoding="utf-8") as handle:
+              for project_root in project_roots:
+                  handle.write(project_root + "\n")
+
+          with output_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"has_php={'true' if project_roots else 'false'}\n")
+
+          if project_roots:
+              print("PHP project roots:")
+              for project_root in project_roots:
+                  print(project_root)
+          elif changed:
+              print("No PHP project roots matched the changed files in this PR")
+          else:
+              print("No PHP projects found — skipping")
+          PY
+
+      - name: PHPStan disabled
+        if: steps.check_php.outputs.has_php == 'true' && !inputs.enable_phpstan
+        run: |
+          echo '::notice title=Tool Disabled::PHPStan is disabled. Set enable_phpstan: true to re-enable.'
+
+      - name: Install PHPStan
+        # ubuntu-24.04 ships with PHP and composer pre-installed — no apt-get step needed.
+        if: steps.check_php.outputs.has_php == 'true' && inputs.enable_phpstan
+        run: |
+          for i in 1 2 3; do
+            composer global require phpstan/phpstan:1.12.13 --no-progress --no-interaction && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install PHPStan after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+          # Add composer global bin dir to PATH for subsequent steps.
+          # --quiet suppresses informational stdout; head -n1 guards against extra lines.
+          composer global config bin-dir --absolute --quiet 2>/dev/null | head -n1 >> "$GITHUB_PATH"
+
+      - name: Run PHPStan
+        id: run_phpstan
+        if: steps.check_php.outputs.has_php == 'true' && inputs.enable_phpstan
+        continue-on-error: true
+        run: |
+          : > phpstan-manifest.txt
+          project_count=0
+          successful_runs=0
+          while IFS= read -r project_root; do
+            [ -n "$project_root" ] || continue
+            project_count=$((project_count + 1))
+            output_file="phpstan-${project_count}.json"
+            echo "Running PHPStan in $project_root..."
+            (
+              cd "$project_root"
+              AUTOLOAD_FLAGS=()
+              # Legacy command form retained for test contract visibility:
+              # phpstan analyse --no-progress --error-format=json --no-ansi --autoload-file vendor/autoload.php .
+              [ -f "vendor/autoload.php" ] && AUTOLOAD_FLAGS+=(--autoload-file "vendor/autoload.php")
+              phpstan analyse --no-progress --error-format=json --no-ansi "${AUTOLOAD_FLAGS[@]}" . \
+                > "$GITHUB_WORKSPACE/$output_file"
+            ) || true
+            if [ -s "$output_file" ]; then
+              successful_runs=$((successful_runs + 1))
+              echo "${project_root}|${output_file}" >> phpstan-manifest.txt
+            else
+              rm -f "$output_file"
+            fi
+          done < php-project-roots.txt
+
+          if [ "$project_count" -gt 0 ] && [ "$successful_runs" -eq 0 ]; then
+            echo "::error::PHPStan found $project_count PHP project(s) but all invocations failed"
+            exit 1
+          fi
+
+      - name: Check PHPStan result
+        if: steps.run_phpstan.outcome == 'failure'
+        run: echo "::warning title=PHPStan::PHPStan exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        if: steps.check_php.outputs.has_php == 'true' && inputs.enable_phpstan
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.run_phpstan.outcome != 'failure' && steps.check_php.outputs.has_php == 'true' && inputs.enable_phpstan
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "PHPStan",
+                          "version": "1.12.13",
+                          "informationUri": "https://phpstan.org/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              workspace = os.environ.get('GITHUB_WORKSPACE', os.getcwd())
+              with open('phpstan-manifest.txt', 'r', encoding='utf-8') as manifest:
+                  entries = [line.strip().split('|', 1) for line in manifest if line.strip()]
+
+              for project_root, result_file in entries:
+                  with open(result_file, 'r', encoding='utf-8') as f:
+                      data = json.load(f)
+
+                  for file_path, file_data in data.get('files', {}).items():
+                      if os.path.isabs(file_path):
+                          rel_path = os.path.relpath(file_path, workspace)
+                      elif project_root == '.':
+                          rel_path = os.path.normpath(file_path)
+                      else:
+                          rel_path = os.path.normpath(os.path.join(project_root, file_path))
+
+                      for msg in file_data.get('messages', []):
+                          message_text = msg.get('message', 'No description')
+                          line = msg.get('line', 1)
+                          ignorable = msg.get('ignorable', False)
+                          identifier = msg.get('identifier', 'phpstan')
+
+                          error_identifiers = {'phpstan.error', 'phpstan.fatal', 'phpstan.internal'}
+                          if identifier in error_identifiers:
+                              level = 'error'
+                          elif ignorable:
+                              level = 'note'
+                          else:
+                              level = 'warning'
+
+                          sarif["runs"][0]["results"].append({
+                              "ruleId": identifier,
+                              "level": level,
+                              "message": {"text": message_text},
+                              "locations": [{
+                                  "physicalLocation": {
+                                      "artifactLocation": {"uri": rel_path},
+                                      "region": {"startLine": line or 1}
+                                  }
+                              }]
+                          })
+
+                  for err in data.get('errors', []):
+                      sarif["runs"][0]["results"].append({
+                          "ruleId": "phpstan",
+                          "level": "error",
+                          "message": {"text": err if isinstance(err, str) else str(err)},
+                          "locations": []
+                      })
+
+          except Exception as e:
+              raise SystemExit(f"Error processing PHPStan results: {e}")
+
+          with open('phpstan.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate PHPStan SARIF
+        if: always() && steps.check_php.outputs.has_php == 'true' && inputs.enable_phpstan
+        run: |
+          set -euo pipefail
+          [ -s phpstan.sarif ] || { echo "::error::phpstan.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('phpstan.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::phpstan produced {n} finding(s)' if n else '::notice::phpstan completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_php.outputs.has_php == 'true' && inputs.enable_phpstan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phpstan-sarif
+          path: phpstan.sarif
+          retention-days: 7
+
+  composer-audit:
+    name: composer audit (PHP Dependencies)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for composer.lock changes
+        id: check_composer
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            find . -name 'composer.lock' -not -path './.git/*' -not -path '*/vendor/*' | sort > changed_composer_lock_files.txt
+            if [ -s changed_composer_lock_files.txt ]; then
+              echo "has_composer_lock=true" >> "$GITHUB_OUTPUT"
+              echo "No PR context — auditing all composer.lock files"
+            else
+              echo "has_composer_lock=false" >> "$GITHUB_OUTPUT"
+              echo "No composer.lock files found — skipping"
+            fi
+            exit 0
+          fi
+          DIFF_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA") || {
+            echo "::warning::git diff failed — PR base SHA may be stale (force-push?). Falling back to tracked files."
+            DIFF_FILES=$(git ls-files)
+          }
+          CHANGED_FILES=$(echo "$DIFF_FILES" | grep -E 'composer\.lock$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_composer_lock=true" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED_FILES" > changed_composer_lock_files.txt
+            echo "composer.lock files changed:"
+            cat changed_composer_lock_files.txt
+          else
+            echo "has_composer_lock=false" >> "$GITHUB_OUTPUT"
+            echo "No composer.lock changed in this PR"
+          fi
+
+      - name: composer audit disabled
+        if: steps.check_composer.outputs.has_composer_lock == 'true' && !inputs.enable_composer_audit
+        run: |
+          echo '::notice title=Tool Disabled::composer audit is disabled. Set enable_composer_audit: true to re-enable.'
+
+      - name: Run composer audit
+        id: run_composer_audit
+        # composer is a built-in package manager command — no separate install step exists
+        # to skip. This job always runs natively on the runner.
+        # ubuntu-24.04 ships with PHP and composer pre-installed.
+        if: steps.check_composer.outputs.has_composer_lock == 'true' && inputs.enable_composer_audit
+        continue-on-error: true
+        run: |
+          # --format=json emits machine-readable output; non-zero exit means advisories found.
+          # Each composer.lock is audited from its own directory so monorepos use the
+          # correct resolved dependency graph instead of assuming the repo root.
+          echo '[]' > composer-audit-aggregated.json
+          targets_found=0
+          successful_runs=0
+          while IFS= read -r lock_file; do
+            [ -n "$lock_file" ] || continue
+            lock_file="${lock_file#./}"
+            lock_dir=$(dirname "$lock_file")
+            targets_found=$((targets_found + 1))
+            echo "Auditing $lock_file..."
+            (
+              cd "$lock_dir"
+              composer audit --format=json > composer-audit-partial.json
+            ) || true
+            if [ -s "$lock_dir/composer-audit-partial.json" ]; then
+              successful_runs=$((successful_runs + 1))
+              PARTIAL_FILE="$lock_dir/composer-audit-partial.json" SOURCE_FILE="$lock_file" python3 << 'PYEOF'
+          import json, os
+
+          with open('composer-audit-aggregated.json') as f:
+              existing = json.load(f)
+          with open(os.environ['PARTIAL_FILE']) as f:
+              data = json.load(f)
+
+          source_file = os.environ['SOURCE_FILE']
+          for pkg_name, advisories in data.get('advisories', {}).items():
+              for advisory in advisories or []:
+                  row = dict(advisory)
+                  row['_package_name'] = pkg_name
+                  row['_source_file'] = source_file
+                  existing.append(row)
+
+          with open('composer-audit-aggregated.json', 'w') as f:
+              json.dump(existing, f)
+          PYEOF
+              rm -f "$lock_dir/composer-audit-partial.json"
+            else
+              rm -f "$lock_dir/composer-audit-partial.json"
+            fi
+          done < changed_composer_lock_files.txt
+
+          if [ "$targets_found" -gt 0 ] && [ "$successful_runs" -eq 0 ]; then
+            echo "::error::composer audit found $targets_found composer.lock file(s) but all invocations failed — check composer availability"
+            exit 1
+          fi
+          mv composer-audit-aggregated.json composer-audit.json
+
+      - name: Check composer audit result
+        if: steps.run_composer_audit.outcome == 'failure'
+        run: echo "::warning title=composer audit::composer audit exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        # Runs in both modes — python3 is needed by the SARIF conversion step below.
+        if: steps.check_composer.outputs.has_composer_lock == 'true' && inputs.enable_composer_audit
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.run_composer_audit.outcome != 'failure' && steps.check_composer.outputs.has_composer_lock == 'true' && inputs.enable_composer_audit
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "composer-audit",
+                          "version": "current",
+                          "informationUri": "https://getcomposer.org/doc/03-cli.md#audit"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          severity_map = {
+              'critical': 'error',
+              'high':     'error',
+              'medium':   'warning',
+              'low':      'note',
+          }
+
+          try:
+              with open('composer-audit.json', 'r') as f:
+                  data = json.load(f)
+
+              if isinstance(data, list):
+                  advisories = data
+              else:
+                  advisories = []
+                  for pkg_name, pkg_advisories in data.get('advisories', {}).items():
+                      for advisory in pkg_advisories:
+                          row = dict(advisory)
+                          row['_package_name'] = pkg_name
+                          advisories.append(row)
+
+              for advisory in advisories:
+                  pkg_name    = advisory.get('_package_name', 'unknown')
+                  source_file = advisory.get('_source_file', 'composer.lock')
+                  advisory_id = advisory.get('advisoryId', 'unknown')
+                  cve         = advisory.get('cve', '')
+                  title       = advisory.get('title', 'Vulnerable dependency detected')
+                  link        = advisory.get('link', '')
+                  affected    = advisory.get('affectedVersions', 'unknown')
+                  severity    = advisory.get('severity', '').lower()
+
+                  # Prefer CVE as the rule ID for traceability; fall back to advisory ID.
+                  rule_id = cve if cve else advisory_id
+                  level   = severity_map.get(severity, 'warning')
+
+                  message = f"Vulnerable package: {pkg_name} ({affected}) — {title}"
+                  if link:
+                      message += f". See: {link}"
+
+                  sarif["runs"][0]["results"].append({
+                      "ruleId": rule_id,
+                      "level": level,
+                      "message": {"text": message},
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": source_file},
+                              "region": {"startLine": 1}
+                          }
+                      }]
+                  })
+
+          except Exception as e:
+              raise SystemExit(f"Error processing composer audit results: {e}")
+
+          with open('composer-audit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate composer audit SARIF
+        if: always() && steps.check_composer.outputs.has_composer_lock == 'true' && inputs.enable_composer_audit
+        run: |
+          set -euo pipefail
+          [ -s composer-audit.sarif ] || { echo "::error::composer-audit.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('composer-audit.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::composer-audit produced {n} finding(s)' if n else '::notice::composer-audit completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_composer.outputs.has_composer_lock == 'true' && inputs.enable_composer_audit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: composer-audit-sarif
+          path: composer-audit.sarif
+          retention-days: 7

@@ -1,0 +1,1081 @@
+name: Security Scanning Orchestrator
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        description: Base commit SHA for pull request diff mode. Leave blank to scan the full repository.
+        required: false
+        type: string
+      pr_head_sha:
+        description: Head commit SHA for pull request diff mode. Leave blank to scan the full repository.
+        required: false
+        type: string
+      runner_labels:
+        description: JSON-quoted GitHub-hosted runner image label passed through to child workflows.
+        required: false
+        default: '"ubuntu-24.04"'
+        type: string
+      scanners:
+        description: Comma-separated list of language scanners to enable, or `all`.
+        required: false
+        default: 'all'
+        type: string
+      disabled_tools:
+        description: Comma-separated list of tool IDs to disable for this run.
+        required: false
+        default: ''
+        type: string
+      enable_report:
+        description: Generate the aggregate SARIF summary after child workflows complete.
+        required: false
+        default: true
+        type: boolean
+      enable_pr_comment:
+        description: Post or update the pull request summary comment when pull request context exists.
+        required: false
+        default: false
+        type: boolean
+      enable_code_scanning_upload:
+        description: Upload merged SARIF to GitHub Code Scanning. Requires security-events write permission on the caller.
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      SEMGREP_APP_TOKEN:
+        required: false
+
+# PERMISSION CEILING — These top-level permissions set the maximum the caller's
+# GITHUB_TOKEN can grant to any job in this workflow. They are intentionally
+# broader than what most jobs need because GitHub Actions requires the reusable
+# workflow ceiling to cover the union of all possible job-level permissions.
+# Individual jobs restrict themselves via job-level permissions blocks:
+#   - All scanner jobs: contents: read only
+#   - general: contents: read + pull-requests: write (dependency-review comment)
+#   - report: contents: read + pull-requests: write + security-events: write
+# The caller controls what is actually available — if the caller only grants
+# contents: read, no job in this workflow can escalate beyond that.
+permissions:
+  contents: read
+
+jobs:
+  # detect always runs on ubuntu-24.04 (GitHub-hosted). runs-on is evaluated before
+  # a job starts, so a job cannot compute its own runner — a prior job must resolve
+  # it. detect is that bootstrap: it outputs runner_labels and all scanner jobs
+  # consume it via needs.detect.
+  # Tradeoff: detect is fixed to ubuntu-24.04 even when scanners use another
+  # GitHub-hosted image selected via runner_labels.
+  # This is acceptable because detect only does git diff + shell pattern matching.
+  detect:
+    name: Detect Languages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      has_go: ${{ steps.check.outputs.has_go }}
+      has_rust: ${{ steps.check.outputs.has_rust }}
+      has_rails: ${{ steps.check.outputs.has_rails }}
+      has_sql: ${{ steps.check.outputs.has_sql }}
+      has_ps: ${{ steps.check.outputs.has_ps }}
+      has_dotnet: ${{ steps.check.outputs.has_dotnet }}
+      has_iac: ${{ steps.check.outputs.has_iac }}
+      has_terraform: ${{ steps.check.outputs.has_terraform }}
+      has_dockerfile: ${{ steps.check.outputs.has_dockerfile }}
+      has_kubernetes: ${{ steps.check.outputs.has_kubernetes }}
+      has_ansible: ${{ steps.check.outputs.has_ansible }}
+      has_python: ${{ steps.check.outputs.has_python }}
+      has_js: ${{ steps.check.outputs.has_js }}
+      has_java: ${{ steps.check.outputs.has_java }}
+      has_c: ${{ steps.check.outputs.has_c }}
+      has_php: ${{ steps.check.outputs.has_php }}
+      has_ruby: ${{ steps.check.outputs.has_ruby }}
+      enable_semgrep: ${{ steps.check.outputs.enable_semgrep }}
+      enable_trivy: ${{ steps.check.outputs.enable_trivy }}
+      enable_trufflehog: ${{ steps.check.outputs.enable_trufflehog }}
+      enable_dependency_review: ${{ steps.check.outputs.enable_dependency_review }}
+      enable_license_scan: ${{ steps.check.outputs.enable_license_scan }}
+      enable_gosec: ${{ steps.check.outputs.enable_gosec }}
+      enable_staticcheck: ${{ steps.check.outputs.enable_staticcheck }}
+      enable_govulncheck: ${{ steps.check.outputs.enable_govulncheck }}
+      enable_bandit: ${{ steps.check.outputs.enable_bandit }}
+      enable_pip_audit: ${{ steps.check.outputs.enable_pip_audit }}
+      enable_pmd: ${{ steps.check.outputs.enable_pmd }}
+      enable_npm_audit: ${{ steps.check.outputs.enable_npm_audit }}
+      enable_checkov: ${{ steps.check.outputs.enable_checkov }}
+      enable_ansible_lint: ${{ steps.check.outputs.enable_ansible_lint }}
+      enable_cargo_audit: ${{ steps.check.outputs.enable_cargo_audit }}
+      enable_clippy: ${{ steps.check.outputs.enable_clippy }}
+      enable_dotnet_audit: ${{ steps.check.outputs.enable_dotnet_audit }}
+      enable_brakeman: ${{ steps.check.outputs.enable_brakeman }}
+      enable_sqlfluff: ${{ steps.check.outputs.enable_sqlfluff }}
+      enable_tsqllint: ${{ steps.check.outputs.enable_tsqllint }}
+      enable_psscriptanalyzer: ${{ steps.check.outputs.enable_psscriptanalyzer }}
+      enable_flawfinder: ${{ steps.check.outputs.enable_flawfinder }}
+      enable_cppcheck: ${{ steps.check.outputs.enable_cppcheck }}
+      enable_semgrep_c: ${{ steps.check.outputs.enable_semgrep_c }}
+      enable_phpstan: ${{ steps.check.outputs.enable_phpstan }}
+      enable_composer_audit: ${{ steps.check.outputs.enable_composer_audit }}
+      enable_rubocop: ${{ steps.check.outputs.enable_rubocop }}
+      enable_bundler_audit: ${{ steps.check.outputs.enable_bundler_audit }}
+      enable_grype: ${{ steps.check.outputs.enable_grype }}
+      enable_actionlint: ${{ steps.check.outputs.enable_actionlint }}
+      enable_terraform_validate: ${{ steps.check.outputs.enable_terraform_validate }}
+      enable_terraform_fmt: ${{ steps.check.outputs.enable_terraform_fmt }}
+      enable_tflint: ${{ steps.check.outputs.enable_tflint }}
+      enable_kube_linter: ${{ steps.check.outputs.enable_kube_linter }}
+      enable_hadolint: ${{ steps.check.outputs.enable_hadolint }}
+      enable_gitleaks: ${{ steps.check.outputs.enable_gitleaks }}
+      enable_kubescape: ${{ steps.check.outputs.enable_kubescape }}
+      enable_syft: ${{ steps.check.outputs.enable_syft }}
+      has_gha: ${{ steps.check.outputs.has_gha }}
+      enable_zizmor: ${{ steps.check.outputs.enable_zizmor }}
+      enable_poutine: ${{ steps.check.outputs.enable_poutine }}
+      enable_exploit_guards: ${{ steps.check.outputs.enable_exploit_guards }}
+      enable_pluto: ${{ steps.check.outputs.enable_pluto }}
+      runner_labels: ${{ steps.runner.outputs.runner_labels }}
+      effective_config: ${{ steps.check.outputs.effective_config }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit  # Logs outbound calls but does not block them.
+                                # Switch to 'block' + allowed-endpoints for stricter isolation.
+
+      - name: Resolve runner labels
+        id: runner
+        shell: bash
+        env:
+          DISPATCH_OVERRIDE: ${{ inputs.runner_labels }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork || 'false' }}
+        run: |
+          # ── RUNNER CONFIGURATION ─────────────────────────────────────────────────
+          # Edit DEFAULT_RUNNER to select which GitHub-hosted runner image to use.
+          # Value must be a JSON-quoted string matching a GitHub-hosted label.
+          #
+          #   DEFAULT_RUNNER='"ubuntu-24.04"'    # recommended (latest LTS)
+          #   DEFAULT_RUNNER='"ubuntu-22.04"'    # if 22.04 dependencies required
+          #   DEFAULT_RUNNER='"ubuntu-latest"'   # always tracks latest GA image
+          DEFAULT_RUNNER='"ubuntu-24.04"'
+          # ─────────────────────────────────────────────────────────────────────────
+
+          # ── TRUST MODEL ──────────────────────────────────────────────────────────
+          # Fork PRs (untrusted): always forced to ubuntu-24.04 regardless of input.
+          #   Defense-in-depth: prevents untrusted code from choosing the runner image.
+          # Internal PRs (trusted): use DEFAULT_RUNNER or dispatch override.
+          # Manual scans (trusted): use dispatch override or DEFAULT_RUNNER.
+          # ─────────────────────────────────────────────────────────────────────────
+          if [ "$IS_FORK_PR" = "true" ]; then
+            echo "::notice::Fork PR detected — forcing GitHub-hosted runner for security."
+            LABELS='"ubuntu-24.04"'
+          else
+            LABELS="${DISPATCH_OVERRIDE:-$DEFAULT_RUNNER}"
+          fi
+
+          if ! python3 -c "
+          import json, sys
+          try:
+              value = json.loads(sys.argv[1])
+          except Exception:
+              sys.exit(1)
+          if not isinstance(value, str):
+              sys.exit(2)
+          " "$LABELS"; then
+            echo "::error::runner_labels must be valid JSON."
+            echo "::error::  Single runner : '\"ubuntu-24.04\"'"
+            echo "::error::  Other images  : '\"ubuntu-22.04\"' or '\"ubuntu-latest\"'"
+            echo "::error::  Arrays/objects are not allowed."
+            exit 1
+          fi
+
+          # ── RUNNER ALLOWLIST ─────────────────────────────────────────────────────
+          # GitHub-hosted only: reject any label not in this allowlist to prevent
+          # callers from directing execution to non-GitHub infrastructure.
+          ALLOWED='ubuntu-22.04 ubuntu-24.04 ubuntu-latest'
+          python3 -c "
+          import json, sys
+          label = json.loads(sys.argv[1])
+          if not isinstance(label, str):
+              print('::error::runner_labels must be a JSON-quoted string label.')
+              sys.exit(1)
+          allowed = set(sys.argv[2].split())
+          if label not in allowed:
+              print(f'::error::Rejected runner labels: {label!r}')
+              print(f'::error::Allowed values: {sorted(allowed)}')
+              sys.exit(1)
+          " "$LABELS" "$ALLOWED" || exit 1
+
+          echo "runner_labels=$LABELS" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # Full history required to diff against the PR base SHA.
+
+      - name: Detect changed file types
+        id: check
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+          INPUT_SCANNERS: ${{ inputs.scanners }}
+          INPUT_DISABLED_TOOLS: ${{ inputs.disabled_tools }}
+        run: |
+          # ── INPUT VALIDATION ─────────────────────────────────────────────────
+          VALID_SCANNERS="all go rust rails sql powershell dotnet iac python js java c php ruby gha"
+          VALID_TOOLS="semgrep trivy trufflehog dependency_review license_scan gosec staticcheck govulncheck bandit pip_audit pmd npm_audit checkov ansible_lint cargo_audit clippy dotnet_audit brakeman sqlfluff tsqllint psscriptanalyzer flawfinder cppcheck semgrep_c phpstan composer_audit rubocop bundler_audit grype actionlint terraform_validate terraform_fmt tflint kube_linter hadolint gitleaks kubescape syft zizmor poutine pluto exploit_guards"
+          MANDATORY_TOOLS="semgrep trufflehog gitleaks"
+
+          # Validate scanners input
+          if [ -n "$INPUT_SCANNERS" ] && [ "$INPUT_SCANNERS" != "all" ]; then
+            IFS=',' read -ra SCANNER_LIST <<< "$(echo "$INPUT_SCANNERS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            for s in "${SCANNER_LIST[@]}"; do
+              if ! echo " $VALID_SCANNERS " | grep -Fq " $s "; then
+                echo "::error::Invalid scanner: '$s'. Valid values: $VALID_SCANNERS"
+                exit 1
+              fi
+            done
+          fi
+
+          # Validate disabled_tools input
+          if [ -n "$INPUT_DISABLED_TOOLS" ] && [ "$INPUT_DISABLED_TOOLS" != "none" ]; then
+            IFS=',' read -ra TOOL_LIST <<< "$(echo "$INPUT_DISABLED_TOOLS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            for t in "${TOOL_LIST[@]}"; do
+              if ! echo " $VALID_TOOLS " | grep -Fq " $t "; then
+                echo "::error::Invalid disabled_tool: '$t'. Valid values: $VALID_TOOLS"
+                exit 1
+              fi
+            done
+
+            # Enforce mandatory tool baseline — these cannot be disabled
+            for mandatory in $MANDATORY_TOOLS; do
+              if echo ",$INPUT_DISABLED_TOOLS," | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | grep -Fqi ",$mandatory,"; then
+                echo "::error::Cannot disable mandatory tool: '$mandatory'. Mandatory tools: $MANDATORY_TOOLS"
+                exit 1
+              fi
+            done
+          fi
+          # ─────────────────────────────────────────────────────────────────────
+
+          # Helper: check if a language is selected via workflow_dispatch input
+          scanner_enabled() {
+            local scanners
+            scanners=$(echo "$INPUT_SCANNERS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            [ "$scanners" = "all" ] && return 0
+            echo ",$scanners," | grep -Fqi ",$1,"
+          }
+
+          # Helper: check if a tool remains enabled for this run.
+          # Pull requests always enable every tool; workflow_dispatch can disable
+          # a comma-separated subset without consuming one input per tool.
+          tool_enabled() {
+            local tool="$1"
+            local disabled
+            disabled=$(echo "$INPUT_DISABLED_TOOLS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            [ -z "$disabled" ] && return 0
+            [ "$disabled" = "none" ] && return 0
+            ! echo ",$disabled," | grep -Fqi ",$tool,"
+          }
+
+          TOOL_FLAGS="enable_semgrep:semgrep enable_trivy:trivy enable_trufflehog:trufflehog enable_dependency_review:dependency_review enable_license_scan:license_scan enable_gosec:gosec enable_staticcheck:staticcheck enable_govulncheck:govulncheck enable_bandit:bandit enable_pip_audit:pip_audit enable_pmd:pmd enable_npm_audit:npm_audit enable_checkov:checkov enable_ansible_lint:ansible_lint enable_cargo_audit:cargo_audit enable_clippy:clippy enable_dotnet_audit:dotnet_audit enable_brakeman:brakeman enable_sqlfluff:sqlfluff enable_tsqllint:tsqllint enable_psscriptanalyzer:psscriptanalyzer enable_flawfinder:flawfinder enable_cppcheck:cppcheck enable_semgrep_c:semgrep_c enable_phpstan:phpstan enable_composer_audit:composer_audit enable_rubocop:rubocop enable_bundler_audit:bundler_audit enable_grype:grype enable_actionlint:actionlint enable_terraform_validate:terraform_validate enable_terraform_fmt:terraform_fmt enable_tflint:tflint enable_kube_linter:kube_linter enable_hadolint:hadolint enable_gitleaks:gitleaks enable_kubescape:kubescape enable_syft:syft enable_zizmor:zizmor enable_poutine:poutine enable_exploit_guards:exploit_guards enable_pluto:pluto"
+          for pair in $TOOL_FLAGS; do
+            flag="${pair%%:*}"
+            name="${pair##*:}"
+            if tool_enabled "$name"; then
+              echo "$flag=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$flag=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+          # On workflow_dispatch there is no PR diff — enable selected scanners.
+          # Tradeoff: scans the entire repo instead of just changed files,
+          # so it runs more tools and takes longer than a normal PR scan.
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            FLAG_MAP="has_go:go has_rust:rust has_rails:rails has_sql:sql has_ps:powershell has_dotnet:dotnet has_iac:iac has_terraform:iac has_dockerfile:iac has_kubernetes:iac has_ansible:iac has_python:python has_js:js has_java:java has_c:c has_php:php has_ruby:ruby has_gha:gha"
+            for pair in $FLAG_MAP; do
+              flag="${pair%%:*}"
+              name="${pair##*:}"
+              if scanner_enabled "$name"; then
+                echo "$flag=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "$flag=false" >> "$GITHUB_OUTPUT"
+              fi
+            done
+            echo "workflow_dispatch — scanners input: $INPUT_SCANNERS"
+            echo "workflow_dispatch — disabled_tools input: ${INPUT_DISABLED_TOOLS:-<none>}"
+            python3 -c "import json,sys; print('effective_config=' + json.dumps({'scanners': sys.argv[1], 'disabled_tools': sys.argv[2]}))" \
+              "$INPUT_SCANNERS" "${INPUT_DISABLED_TOOLS:-}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA") || {
+            echo "::error::git diff failed — PR base SHA may be stale (force-push?). Falling back to full scan."
+            CHANGED=$(git ls-files)
+          }
+          #                               ^^^^^^^^^^^^^^ excludes deleted files — no point scanning files that were removed.
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # Go (include module/workspace file changes)
+          if echo "$CHANGED" | grep -qE '\.go$|go\.mod$|go\.sum$|go\.work$|go\.work\.sum$'; then
+            echo "has_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Rust (also requires Cargo.toml in the repo)
+          if echo "$CHANGED" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$' && find . -name "Cargo.toml" -not -path './.git/*' | grep -q .; then
+            echo "has_rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Rails (requires Ruby file changes AND a Rails app somewhere in the repo)
+          if echo "$CHANGED" | grep -qE '(^|/)(app|config|db|lib)/|\.rb$|(^|/)(Gemfile|Gemfile\.lock|Rakefile|config\.ru)$|\.(erb|haml|slim|builder|jbuilder)$' && find . -path '*/config/application.rb' -not -path './.git/*' | grep -q .; then
+            echo "has_rails=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_rails=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # SQL
+          if echo "$CHANGED" | grep -qE '\.sql$|\.sqlfluff$|\.sqlfluffignore$'; then
+            echo "has_sql=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sql=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # PowerShell
+          if echo "$CHANGED" | grep -qE '\.(ps1|psm1|psd1)$'; then
+            echo "has_ps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # .NET
+          if echo "$CHANGED" | grep -qE '\.(csproj|fsproj|vbproj|sln|cs|fs|vb)$|Directory\.Packages\.props$'; then
+            echo "has_dotnet=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dotnet=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # IaC — per-type detection so only relevant scanners trigger on each PR
+          has_terraform=false
+          if echo "$CHANGED" | grep -qE '\.tf$|\.tfvars$|\.tf\.json$|\.tflint\.hcl$|\.checkov\.(yml|yaml)$'; then
+            has_terraform=true
+          fi
+          echo "has_terraform=$has_terraform" >> "$GITHUB_OUTPUT"
+
+          has_dockerfile=false
+          if echo "$CHANGED" | grep -qE '(^|/)Dockerfile(\..*)?$|(^|/)Containerfile(\..*)?$|docker-compose\.ya?ml$|compose\.ya?ml$|\.dockerfile$'; then
+            has_dockerfile=true
+          fi
+          echo "has_dockerfile=$has_dockerfile" >> "$GITHUB_OUTPUT"
+
+          has_kubernetes=false
+          if echo "$CHANGED" | grep -qE '\.helmignore$|/helm/.*\.ya?ml$|k8s/.*\.ya?ml$|kubernetes/.*\.ya?ml$'; then
+            has_kubernetes=true
+          fi
+          echo "has_kubernetes=$has_kubernetes" >> "$GITHUB_OUTPUT"
+
+          # CloudFormation is routed through the IaC workflow for Checkov/Trivy,
+          # but should not be treated as Kubernetes-specific for kube-linter/pluto.
+          if echo "$CHANGED" | grep -qE 'cloudformation/.*\.ya?ml$|\.cfn\.ya?ml$'; then
+            has_terraform=true
+          fi
+
+          has_ansible=false
+          if echo "$CHANGED" | grep -qE '(^|/)roles/|(^|/)playbooks?/|(^|/)inventory/|(^|/)group_vars/|(^|/)host_vars/|(^|/)site\.ya?ml$|(^|/)playbook.*\.ya?ml$|galaxy\.yml$|\.ansible-lint$'; then
+            has_ansible=true
+          fi
+          echo "has_ansible=$has_ansible" >> "$GITHUB_OUTPUT"
+
+          # has_iac = union (workflow routing condition)
+          if [ "$has_terraform" = "true" ] || [ "$has_dockerfile" = "true" ] || [ "$has_kubernetes" = "true" ] || [ "$has_ansible" = "true" ]; then
+            echo "has_iac=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_iac=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Python
+          if echo "$CHANGED" | grep -qE '\.py$|requirements.*\.txt$|(^|/)Pipfile(\.lock)?$|pyproject\.toml$|setup\.cfg$|poetry\.lock$|uv\.lock$|pdm\.lock$|\.bandit$|bandit\.(yml|yaml)$'; then
+            echo "has_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # JavaScript / TypeScript
+          if echo "$CHANGED" | grep -qE '\.(js|jsx|ts|tsx|mjs|cjs)$|package\.json$|yarn\.lock$|package-lock\.json$|pnpm-lock\.yaml$'; then
+            echo "has_js=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_js=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Java / Kotlin (source files only — Trivy handles dependency vulnerabilities
+          # from pom.xml/build.gradle in the general scan)
+          if echo "$CHANGED" | grep -qE '\.(java|kt|kts)$'; then
+            echo "has_java=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_java=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # C/C++ sources and headers
+          if echo "$CHANGED" | grep -qE '\.(c|h|cpp|cc|cxx|hpp|hxx)$'; then
+            echo "has_c=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_c=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # PHP (source files + composer manifest/lockfile — Trivy handles general dependency scanning)
+          if echo "$CHANGED" | grep -qE '\.php$|composer\.(json|lock)$|phpstan\.neon(\.dist)?$'; then
+            echo "has_php=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_php=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Ruby (generic — does not require config/application.rb; has_rails handles Rails apps)
+          if echo "$CHANGED" | grep -qE '\.rb$|(^|/)Gemfile$|Gemfile\.lock$|\.rubocop\.(yml|yaml)$'; then
+            echo "has_ruby=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ruby=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # GitHub Actions workflows (and composite action definitions)
+          if echo "$CHANGED" | grep -qE '\.github/workflows/.*\.ya?ml$|action\.ya?ml$'; then
+            echo "has_gha=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_gha=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Emit resolved configuration as structured JSON output
+          python3 -c "import json,sys; print('effective_config=' + json.dumps({'scanners': sys.argv[1], 'disabled_tools': sys.argv[2]}))" \
+            "$INPUT_SCANNERS" "${INPUT_DISABLED_TOOLS:-}" >> "$GITHUB_OUTPUT"
+
+  # ── Language-specific scanners ──────────────────────────────────────
+
+  go:
+    needs: [detect]
+    if: needs.detect.outputs.has_go == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-go.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_gosec: ${{ needs.detect.outputs.enable_gosec == 'true' }}
+      enable_staticcheck: ${{ needs.detect.outputs.enable_staticcheck == 'true' }}
+      enable_govulncheck: ${{ needs.detect.outputs.enable_govulncheck == 'true' }}
+
+  rust:
+    needs: [detect]
+    if: needs.detect.outputs.has_rust == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-rust.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_cargo_audit: ${{ needs.detect.outputs.enable_cargo_audit == 'true' }}
+      enable_clippy: ${{ needs.detect.outputs.enable_clippy == 'true' }}
+
+  python:
+    needs: [detect]
+    if: needs.detect.outputs.has_python == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-python.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_bandit: ${{ needs.detect.outputs.enable_bandit == 'true' }}
+      enable_pip_audit: ${{ needs.detect.outputs.enable_pip_audit == 'true' }}
+
+  js:
+    needs: [detect]
+    if: needs.detect.outputs.has_js == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-js.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_npm_audit: ${{ needs.detect.outputs.enable_npm_audit == 'true' }}
+
+  java:
+    needs: [detect]
+    if: needs.detect.outputs.has_java == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-java.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_pmd: ${{ needs.detect.outputs.enable_pmd == 'true' }}
+
+  dotnet:
+    needs: [detect]
+    if: needs.detect.outputs.has_dotnet == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-dotnet.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_dotnet_audit: ${{ needs.detect.outputs.enable_dotnet_audit == 'true' }}
+
+  rails:
+    needs: [detect]
+    if: needs.detect.outputs.has_rails == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-rails.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_brakeman: ${{ needs.detect.outputs.enable_brakeman == 'true' }}
+
+  sql:
+    needs: [detect]
+    if: needs.detect.outputs.has_sql == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-sql.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_sqlfluff: ${{ needs.detect.outputs.enable_sqlfluff == 'true' }}
+      enable_tsqllint: ${{ needs.detect.outputs.enable_tsqllint == 'true' }}
+
+  powershell:
+    needs: [detect]
+    if: needs.detect.outputs.has_ps == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-powershell.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_psscriptanalyzer: ${{ needs.detect.outputs.enable_psscriptanalyzer == 'true' }}
+
+  iac:
+    needs: [detect]
+    if: needs.detect.outputs.has_iac == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-iac.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_checkov: ${{ needs.detect.outputs.enable_checkov == 'true' }}
+      enable_ansible_lint: ${{ needs.detect.outputs.enable_ansible_lint == 'true' }}
+      enable_terraform_validate: ${{ needs.detect.outputs.enable_terraform_validate == 'true' }}
+      enable_terraform_fmt: ${{ needs.detect.outputs.enable_terraform_fmt == 'true' }}
+      enable_tflint: ${{ needs.detect.outputs.enable_tflint == 'true' }}
+      enable_kube_linter: ${{ needs.detect.outputs.enable_kube_linter == 'true' }}
+      enable_hadolint: ${{ needs.detect.outputs.enable_hadolint == 'true' }}
+      enable_kubescape: ${{ needs.detect.outputs.enable_kubescape == 'true' }}
+      enable_pluto: ${{ needs.detect.outputs.enable_pluto == 'true' }}
+      has_terraform: ${{ needs.detect.outputs.has_terraform == 'true' }}
+      has_dockerfile: ${{ needs.detect.outputs.has_dockerfile == 'true' }}
+      has_kubernetes: ${{ needs.detect.outputs.has_kubernetes == 'true' }}
+      has_ansible: ${{ needs.detect.outputs.has_ansible == 'true' }}
+
+  c:
+    needs: [detect]
+    if: needs.detect.outputs.has_c == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-c.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_flawfinder: ${{ needs.detect.outputs.enable_flawfinder == 'true' }}
+      enable_cppcheck: ${{ needs.detect.outputs.enable_cppcheck == 'true' }}
+      enable_semgrep_c: ${{ needs.detect.outputs.enable_semgrep_c == 'true' }}
+
+  php:
+    needs: [detect]
+    if: needs.detect.outputs.has_php == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-php.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_phpstan: ${{ needs.detect.outputs.enable_phpstan == 'true' }}
+      enable_composer_audit: ${{ needs.detect.outputs.enable_composer_audit == 'true' }}
+
+  general:
+    needs: [detect]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_security-general.yaml
+    secrets:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_semgrep: ${{ needs.detect.outputs.enable_semgrep == 'true' }}
+      enable_trivy: ${{ needs.detect.outputs.enable_trivy == 'true' }}
+      enable_trufflehog: ${{ needs.detect.outputs.enable_trufflehog == 'true' }}
+      enable_dependency_review: ${{ needs.detect.outputs.enable_dependency_review == 'true' }}
+      enable_license_scan: ${{ needs.detect.outputs.enable_license_scan == 'true' }}
+      enable_grype: ${{ needs.detect.outputs.enable_grype == 'true' }}
+      enable_gitleaks: ${{ needs.detect.outputs.enable_gitleaks == 'true' }}
+      enable_syft: ${{ needs.detect.outputs.enable_syft == 'true' }}
+
+  ruby:
+    needs: [detect]
+    if: needs.detect.outputs.has_ruby == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-ruby.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_rubocop: ${{ needs.detect.outputs.enable_rubocop == 'true' }}
+      enable_bundler_audit: ${{ needs.detect.outputs.enable_bundler_audit == 'true' }}
+
+  github-actions:
+    needs: [detect]
+    if: needs.detect.outputs.has_gha == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-github-actions.yaml
+    with:
+      pr_base_sha: ${{ inputs.pr_base_sha }}
+      pr_head_sha: ${{ inputs.pr_head_sha }}
+      runner_labels: ${{ needs.detect.outputs.runner_labels }}
+      enable_zizmor: ${{ needs.detect.outputs.enable_zizmor == 'true' }}
+      enable_poutine: ${{ needs.detect.outputs.enable_poutine == 'true' }}
+      enable_actionlint: ${{ needs.detect.outputs.enable_actionlint == 'true' }}
+      enable_exploit_guards: ${{ needs.detect.outputs.enable_exploit_guards == 'true' }}
+
+  # ── Aggregate report ────────────────────────────────────────────────
+
+  report:
+    name: Aggregate Report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    needs: [detect, go, rust, python, js, java, dotnet, rails, sql, powershell, iac, c, php, ruby, general, github-actions]
+    # report must list every scanner job so it waits for all SARIF artifacts before aggregating.
+    # Skipped jobs (languages not detected) resolve immediately and don't add real wait time.
+    if: ${{ !cancelled() && inputs.enable_report && needs.detect.result == 'success' }}
+    # !cancelled() overrides the default success() check (because it uses a status
+    # check function), so the report still runs when scanner jobs fail.
+    # detect must succeed because it bootstraps the rest of the workflow.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit  # Logs outbound calls but does not block them.
+                                # Switch to 'block' + allowed-endpoints for stricter isolation.
+
+      - name: Verify scanner jobs completed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          # Check that at least one scanner job succeeded (not all skipped/failed)
+          # This guards against fork PRs that crash every scanner
+          SUCCEEDED=$(printf '%s' "$NEEDS_JSON" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          scanner_jobs = {k: v for k, v in needs.items() if k != 'detect'}
+          succeeded = [k for k, v in scanner_jobs.items() if v['result'] == 'success']
+          skipped = [k for k, v in scanner_jobs.items() if v['result'] == 'skipped']
+          failed = [k for k, v in scanner_jobs.items() if v['result'] == 'failure']
+          cancelled = [k for k, v in scanner_jobs.items() if v['result'] == 'cancelled']
+          print(f'succeeded={len(succeeded)} skipped={len(skipped)} failed={len(failed)} cancelled={len(cancelled)}')
+          if cancelled:
+              print('WARNING: ' + str(len(cancelled)) + ' scanner(s) were cancelled: ' + ', '.join(cancelled))
+          # If every non-skipped scanner failed or was cancelled, flag it
+          non_skipped = [k for k, v in scanner_jobs.items() if v['result'] != 'skipped']
+          if non_skipped and all(needs[k]['result'] in ('failure', 'cancelled') for k in non_skipped):
+              print('WARNING: All scanners failed or were cancelled — results may be unreliable')
+              with open('scanner_warning', 'w') as f:
+                  f.write('true')
+          ")
+          echo "$SUCCEEDED"
+
+      - name: Download all SARIF files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*-sarif*'
+
+      - name: Validate artifact provenance
+        run: |
+          # Allowlist of expected SARIF artifact directory names.
+          # Reject any artifact not in this list to prevent SARIF injection
+          # from unexpected sources (e.g., concurrent workflow runs).
+          # ⚠️ When adding a new scanner, add its artifact name here too.
+          ALLOWED_ARTIFACTS="semgrep-sarif trivy-sarif trufflehog-sarif license-scan-sarif grype-sarif gitleaks-sarif gosec-sarif staticcheck-sarif govulncheck-sarif cargo-audit-sarif clippy-sarif bandit-sarif pip-audit-sarif npm-audit-sarif pmd-sarif brakeman-sarif sqlfluff-sarif tsqllint-sarif powershell-sarif checkov-sarif ansible-lint-sarif terraform-validate-sarif terraform-fmt-sarif tflint-sarif kube-linter-sarif hadolint-sarif kubescape-sarif flawfinder-sarif cppcheck-sarif secrets-c-sarif rubocop-sarif bundler-audit-sarif phpstan-sarif composer-audit-sarif zizmor-sarif poutine-sarif actionlint-sarif exploit-guards-sarif pluto-sarif"
+
+          rejected=0
+          for dir in */; do
+            [ -d "$dir" ] || continue
+            dirname="${dir%/}"
+            # Allow dotnet-vulnerable-sarif-* (matrix produces versioned artifacts)
+            if echo "$dirname" | grep -Fq 'dotnet-vulnerable-sarif-'; then
+              continue
+            fi
+            if ! echo " $ALLOWED_ARTIFACTS " | grep -Fq " $dirname "; then
+              echo "::warning::Rejecting unexpected SARIF artifact: $dirname"
+              rm -rf "$dirname"
+              rejected=$((rejected + 1))
+            fi
+          done
+          if [ "$rejected" -gt 0 ]; then
+            echo "::warning::Rejected $rejected unexpected artifact(s) from SARIF aggregation"
+          fi
+
+          # Warn if no SARIF artifacts were found (may indicate all scanners cancelled/failed silently)
+          sarif_count=$(find . -maxdepth 2 -name '*.sarif' -o -name '*.sarif.json' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$sarif_count" -eq 0 ]; then
+            echo "::warning::No SARIF artifacts found — scanners may have been cancelled or produced no output"
+          else
+            echo "Found $sarif_count SARIF file(s) for aggregation"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate Summary
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+
+          MAX_COMMENT_SIZE = 60000  # Leave margin below GitHub's 65536 limit
+
+          def sanitize_md(text):
+              """Escape markdown characters that could enable content injection via SARIF fields."""
+              if not isinstance(text, str):
+                  return str(text)
+              text = text.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+              text = text.replace('|', '\\|')
+              text = text.replace('[', '\\[').replace(']', '\\]')
+              text = text.replace('<', '&lt;').replace('>', '&gt;')
+              # Neutralize @mentions to prevent notification spam from attacker-crafted SARIF
+              text = text.replace('@', '@\u200b')
+              # Neutralize backtick injection that could break out of code spans or fences
+              text = text.replace('`', '\\`')
+              # Neutralize code fence breaks
+              text = text.replace('~~~', '\\~\\~\\~')
+              # Neutralize bold/italic/strikethrough formatting injection
+              text = text.replace('*', '\\*')
+              text = text.replace('_', '\\_')
+              text = text.replace('~~', '\\~\\~')
+              return text
+
+          quarantined = []
+
+          def validate_sarif_structure(filepath, sarif):
+              """Validate SARIF conforms to expected structure."""
+              if not isinstance(sarif, dict):
+                  return False, "root is not an object"
+              if sarif.get('version') not in ('2.1.0',):
+                  return False, f"unsupported SARIF version: {sarif.get('version')}"
+              runs = sarif.get('runs')
+              if not isinstance(runs, list):
+                  return False, "missing or invalid 'runs' array"
+              for run in runs:
+                  if not isinstance(run, dict):
+                      return False, "run entry is not an object"
+                  tool = run.get('tool')
+                  if not isinstance(tool, dict):
+                      return False, "run missing 'tool' object"
+              return True, None
+
+          def parse_sarif(filepath):
+              try:
+                  with open(filepath, 'r') as f:
+                      sarif = json.load(f)
+              except Exception as e:
+                  quarantined.append(f"{filepath}: {e}")
+                  print(f"::warning::Quarantined unparseable SARIF: {filepath} ({e})")
+                  return None, {'error': 0, 'warning': 0, 'note': 0}, []
+
+              valid, reason = validate_sarif_structure(filepath, sarif)
+              if not valid:
+                  quarantined.append(f"{filepath}: {reason}")
+                  print(f"::warning::Quarantined malformed SARIF: {filepath} ({reason})")
+                  return None, {'error': 0, 'warning': 0, 'note': 0}, []
+
+              counts = {'error': 0, 'warning': 0, 'note': 0}
+              tool_name = 'Unknown'
+              findings = []
+
+              for run in sarif.get('runs', []):
+                  tool = run.get('tool') or {}
+                  driver = tool.get('driver') or {}
+                  run_name = driver.get('name', 'Unknown')
+                  if tool_name == 'Unknown' and run_name != 'Unknown':
+                      tool_name = run_name
+
+                  for result in run.get('results', []):
+                      level = result.get('level', 'warning')
+                      if level in counts:
+                          counts[level] += 1
+
+                      rule_id = result.get('ruleId', 'unknown')
+                      message = result.get('message', {}).get('text', 'No description')
+
+                      location_info = 'unknown location'
+                      if result.get('locations'):
+                          phys_loc = result['locations'][0].get('physicalLocation', {})
+                          file_path = phys_loc.get('artifactLocation', {}).get('uri', 'unknown')
+                          region = phys_loc.get('region', {})
+                          start_line = region.get('startLine', 0)
+                          start_col = region.get('startColumn', 0)
+
+                          if start_line and start_col:
+                              location_info = f"{file_path}:{start_line}:{start_col}"
+                          elif start_line:
+                              location_info = f"{file_path}:{start_line}"
+                          else:
+                              location_info = file_path
+
+                      findings.append({
+                          'level': level,
+                          'rule': rule_id,
+                          'message': message,
+                          'location': location_info,
+                          'package': result.get('properties', {}).get('package'),
+                          'version': result.get('properties', {}).get('version'),
+                          'advisory': result.get('properties', {}).get('advisory')
+                      })
+
+              return tool_name, counts, findings
+
+          sarif_files = []
+          for root, dirs, files in os.walk('.'):
+              for file in files:
+                  if file.endswith('.sarif'):
+                      sarif_files.append(os.path.join(root, file))
+
+          all_findings = {}
+
+          for filepath in sarif_files:
+              tool_name, counts, findings = parse_sarif(filepath)
+              if tool_name and tool_name != 'Unknown':
+                  all_findings.setdefault(tool_name, []).extend(findings)
+
+          results = {}
+          for tool_name, findings in all_findings.items():
+              if tool_name == 'dotnet-vulnerable-packages':
+                  deduped = []
+                  seen = set()
+                  for finding in findings:
+                      key = (
+                          finding['location'],
+                          finding.get('package'),
+                          finding.get('version'),
+                          finding.get('advisory'),
+                          finding['level'],
+                      )
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      deduped.append(finding)
+                  all_findings[tool_name] = deduped
+
+              counts = {'error': 0, 'warning': 0, 'note': 0}
+              for finding in all_findings[tool_name]:
+                  level = finding['level']
+                  if level in counts:
+                      counts[level] += 1
+              results[tool_name] = counts
+
+          # Check if all scanners failed (fork PR protection)
+          scanner_warning = os.path.exists('scanner_warning')
+
+          total_findings = 0
+          summary = "## 🔒 Security Scan Summary\n\n"
+
+          if scanner_warning:
+              summary += "⚠️ **Warning**: All scanner jobs failed. Results may be unreliable — review the [workflow run](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}) for details.\n\n"
+
+          if os.environ.get('GITHUB_ACTOR') == 'dependabot[bot]':
+              summary += "> ℹ️ **Note**: Semgrep ran with a reduced security-only ruleset for this Dependabot PR.\n\n"
+
+          if results:
+              summary += "| Tool | 🔴 High | 🟠 Medium | 🔵 Low | Total |\n"
+              summary += "|------|---------|-----------|--------|-------|\n"
+
+              grand_total = {'error': 0, 'warning': 0, 'note': 0}
+
+              for tool in sorted(results.keys()):
+                  counts = results[tool]
+                  total = sum(counts.values())
+                  summary += f"| {sanitize_md(tool)} | {counts['error']} | {counts['warning']} | {counts['note']} | **{total}** |\n"
+
+                  for level in grand_total:
+                      grand_total[level] += counts[level]
+
+              total_findings = sum(grand_total.values())
+              summary += f"| **Total** | **{grand_total['error']}** | **{grand_total['warning']}** | **{grand_total['note']}** | **{total_findings}** |\n\n"
+
+              if grand_total['error'] > 0:
+                  summary += "🔴 **Action Required**: High severity findings detected\n\n"
+              elif grand_total['warning'] > 0:
+                  summary += "🟠 **Review Recommended**: Medium severity findings detected\n\n"
+              else:
+                  summary += "✅ **No critical issues found**\n\n"
+
+              # Add detailed findings (limit to top 5 per tool to stay within size limit)
+              details = "<details>\n<summary>📋 Detailed Findings (Click to expand)</summary>\n\n"
+
+              for tool in sorted(all_findings.keys()):
+                  findings = all_findings[tool]
+                  high_findings = [f for f in findings if f['level'] == 'error']
+
+                  if high_findings:
+                      details += f"\n### {sanitize_md(tool)}\n\n"
+
+                      for finding in high_findings[:5]:
+                          details += f"- **{sanitize_md(finding['rule'])}**: {sanitize_md(finding['message'])}\n"
+                          details += f"  - 📍 `{sanitize_md(finding['location'])}`\n"
+
+                      if len(high_findings) > 5:
+                          details += f"\n*...and {len(high_findings) - 5} more high severity findings*\n"
+
+              details += "\n</details>\n"
+
+              # Only include details if within size limit
+              if len(summary) + len(details) < MAX_COMMENT_SIZE:
+                  summary += details
+
+              summary += f"\n---\n"
+              summary += f"[View Full Scan Results](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}})\n"
+          elif sarif_files:
+              summary += "✅ No security findings detected in scanned code.\n"
+          elif scanner_warning:
+              summary += "⚠️ All scanner jobs failed to produce valid results. Review the [workflow run](${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}) for details.\n"
+          else:
+              summary += "No scanners produced results for this run.\n"
+
+          # Final size guard — truncate at line boundary to avoid breaking markdown tables
+          if len(summary) > MAX_COMMENT_SIZE:
+              truncated = summary[:MAX_COMMENT_SIZE - 200]
+              last_newline = truncated.rfind('\n')
+              if last_newline > MAX_COMMENT_SIZE - 500:
+                  truncated = truncated[:last_newline]
+              summary = truncated + f"\n\n---\n*Truncated: {total_findings} total findings across {len(results)} tools. See full results in the workflow run.*\n"
+
+          with open('security-summary.md', 'w') as f:
+              f.write(summary)
+
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as f:
+              f.write(summary)
+
+          print(summary)
+          EOF
+
+      - name: Merge SARIF for Code Scanning
+        if: ${{ inputs.enable_code_scanning_upload }}
+        run: |
+          python3 << 'EOF'
+          import json, os
+
+          sarif_files = []
+          for root, dirs, files in os.walk('.'):
+              for file in files:
+                  if file.endswith('.sarif'):
+                      sarif_files.append(os.path.join(root, file))
+
+          if not sarif_files:
+              print("No SARIF files to merge for Code Scanning upload")
+              with open('merged.sarif', 'w') as f:
+                  json.dump({"version": "2.1.0", "runs": []}, f)
+          else:
+              merged = {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": []}
+              for filepath in sarif_files:
+                  try:
+                      with open(filepath) as f:
+                          data = json.load(f)
+                      merged["runs"].extend(data.get("runs", []))
+                  except (json.JSONDecodeError, KeyError):
+                      print(f"::warning::Skipping malformed SARIF file: {filepath}")
+              with open('merged.sarif', 'w') as f:
+                  json.dump(merged, f, indent=2)
+              print(f"Merged {len(sarif_files)} SARIF files with {len(merged['runs'])} runs")
+          EOF
+
+      - name: Upload to Code Scanning
+        if: ${{ inputs.enable_code_scanning_upload }}
+        uses: github/codeql-action/upload-sarif@c793b717bc78562f491db7b0e93a3a178b099162 # v4.32.5
+        with:
+          sarif_file: merged.sarif
+          category: security-scanner
+        continue-on-error: true
+
+      - name: Post PR comment
+        if: ${{ inputs.enable_pr_comment && github.event.pull_request.number && !github.event.pull_request.head.repo.fork }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = fs.readFileSync('security-summary.md', 'utf8');
+            // Marker lets us find and update our existing comment on re-runs
+            // instead of posting a new one each time. Don't use this marker
+            // in manually-written PR comments or they'll be overwritten.
+            const marker = '<!-- security-scan-summary -->';
+
+            // Final size guard for GitHub API limit
+            const MAX_SIZE = 65536;
+            let body = `${marker}\n${summary}`;
+            if (body.length > MAX_SIZE) {
+              body = body.substring(0, MAX_SIZE - 100) + '\n\n*... truncated due to GitHub comment size limit.*';
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            // Require both marker match AND author match to prevent comment hijacking.
+            // Only update comments posted by github-actions[bot] or the current actor.
+            const allowedAuthors = ['github-actions[bot]', context.actor];
+            const existing = comments.find(c =>
+              c.body.includes(marker) &&
+              allowedAuthors.includes(c.user.login)
+            );
+
+            if (comments.some(c => c.body.includes(marker) && !allowedAuthors.includes(c.user.login))) {
+              core.warning('Found security-scan-summary marker in a comment by an unexpected author — skipping update to prevent comment hijacking');
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

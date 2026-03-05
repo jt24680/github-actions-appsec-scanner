@@ -1,0 +1,20 @@
+# Intentionally insecure CloudFormation template for Checkov testing.
+# Missing: S3 encryption, overly permissive security group.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Insecure fixture for security scanning tests.
+
+Resources:
+  InsecureBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: test-insecure-bucket
+
+  WideOpenSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Intentionally insecure SG for testing
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0

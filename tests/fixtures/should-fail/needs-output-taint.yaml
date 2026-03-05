@@ -1,0 +1,26 @@
+name: needs-output-taint
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      title: ${{ steps.grab.outputs.result }}
+    steps:
+      - id: grab
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          result-encoding: string
+          script: return context.payload.pull_request.title
+  inject:
+    needs: extract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - run: echo "${{ needs.extract.outputs.title }}"

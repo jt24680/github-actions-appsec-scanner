@@ -1,0 +1,82 @@
+name: "Security Scanning: CI"
+# Least-privilege CI workflow for push, schedule, and manual dispatch events.
+# Only grants security-events: write (for Code Scanning upload).
+# Does NOT grant pull-requests: write (no PR context on these events).
+# Pair with _orchestrator-pr.yaml for pull request events.
+# Pair with _orchestrator-pr.yaml for pull request events.
+on:
+  push:
+    branches: [ main, develop ]  # Scan on merge to catch vulnerabilities missed before PR was created.
+  schedule:
+    - cron: '0 6 * * 1'         # Weekly Monday 06:00 UTC — catch new CVEs in stable code.
+  workflow_dispatch:
+    inputs:
+      scanners:
+        description: |
+          Comma-separated list of languages to scan (or "all").
+          Valid values: go, rust, rails, sql, powershell, dotnet, iac,
+          python, js, java, c, php, ruby, gha.
+          Use disabled_tools to turn off individual scanners.
+        required: false
+        default: 'all'
+        type: string
+      runner_labels:
+        description: |
+          GitHub-hosted runner image label. Override the DEFAULT_RUNNER
+          set in the detect job. Leave blank to use the DEFAULT_RUNNER value.
+            '"ubuntu-24.04"'    # default (LTS)
+            '"ubuntu-22.04"'    # if 22.04 dependencies required
+            '"ubuntu-latest"'   # always tracks latest GA image
+        required: false
+        type: string
+      disabled_tools:
+        description: |
+          Comma-separated tool IDs to disable for this manual run. Leave blank
+          to run every tool. Valid IDs: semgrep, trivy, trufflehog,
+          dependency_review, license_scan, gosec, staticcheck, govulncheck,
+          bandit, pip_audit, pmd, npm_audit, checkov, ansible_lint,
+          cargo_audit, clippy, dotnet_audit, brakeman, sqlfluff, tsqllint,
+          psscriptanalyzer, flawfinder, cppcheck, semgrep_c, phpstan,
+          composer_audit, rubocop, bundler_audit, grype, actionlint,
+          terraform_validate, terraform_fmt, tflint, kube_linter, hadolint,
+          gitleaks, kubescape, syft, zizmor, poutine, pluto,
+          exploit_guards
+        required: false
+        default: ''
+        type: string
+      enable_code_scanning_upload:
+        description: |
+          Upload merged SARIF to GitHub Code Scanning.
+          Enabled by default on push and schedule events.
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  # push/schedule: cancel stale runs on the same ref.
+  # workflow_dispatch: isolate each manual run via run_id and do not auto-cancel.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+# LEAST PRIVILEGE: Only the permissions actually needed for CI events.
+# security-events: write removed — GHAS not available on this private repo.
+# pull-requests: write is NOT granted — no PR context on push/schedule/dispatch.
+permissions:
+  contents: read
+
+jobs:
+  orchestrate:
+    name: Orchestrate Security Scans
+    permissions:
+      contents: read
+    uses: ./.github/workflows/orchestrator-reusable.yaml
+    secrets:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    with:
+      runner_labels: ${{ github.event.inputs.runner_labels || '' }}
+      scanners: ${{ github.event.inputs.scanners || 'all' }}
+      disabled_tools: ${{ github.event.inputs.disabled_tools || '' }}
+      # Code Scanning upload is enabled automatically on push and schedule events,
+      # and configurable on workflow_dispatch (defaults to true).
+      enable_code_scanning_upload: false  # GHAS not available on this private repo.
+      enable_pr_comment: false  # No PR context on push/schedule/dispatch events.

@@ -1,0 +1,440 @@
+name: Ruby Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_rubocop:
+        type: boolean
+        default: true
+      enable_bundler_audit:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  rubocop:
+    name: RuboCop (Ruby Security)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed Ruby files
+        id: check_ruby
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_ruby_files.txt
+          label: Ruby
+          include-regex: '\.rb$|(^|/)Gemfile(\.lock)?$|\.rubocop\.(yml|yaml)$'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      - name: RuboCop disabled
+        if: steps.check_ruby.outputs.has_files == 'true' && !inputs.enable_rubocop
+        run: |
+          echo '::notice title=Tool Disabled::RuboCop is disabled. Set enable_rubocop: true to re-enable.'
+
+      - name: Set up Ruby
+        if: steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        uses: ruby/setup-ruby@09a7688d3b55cf0e976497ff046b70949eeaccfd # v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false  # Don't install Gemfile gems — rubocop only needs its own gem.
+
+      - name: Cache RuboCop
+        if: steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.gem
+          key: ${{ runner.os }}-gems-rubocop-${{ hashFiles('.github/workflows/security-ruby.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-gems-rubocop-
+
+      - name: Install RuboCop
+        if: steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        run: |
+          for i in 1 2 3; do
+            gem install rubocop:1.72.0 rubocop-ast:1.44.1 --no-document && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install RuboCop after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run RuboCop
+        id: run_rubocop
+        if: steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        continue-on-error: true
+        run: |
+          # --only Security scopes the scan to RuboCop's Security category (Security::Eval,
+          # Security::Open, Security::YAMLLoad, Security::MarshalLoad, Security::IoMethods,
+          # etc.) and avoids style noise in a DevSecOps context.
+          # xargs -0 consumes the NUL-delimited manifest produced by the detection step.
+          # '|| true' prevents exit code 1 (offenses found) from failing the step.
+          xargs -0 rubocop --only Security --format json --out rubocop.json --no-color -- < changed_ruby_files.txt || true
+
+      - name: Check RuboCop result
+        if: steps.run_rubocop.outcome == 'failure'
+        run: echo "::warning title=RuboCop::RuboCop exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        # Runs in both modes — python3 is needed by the SARIF conversion step below.
+        if: steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.run_rubocop.outcome != 'failure' && steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "RuboCop",
+                          "version": "1.72.0",
+                          "informationUri": "https://rubocop.org/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          severity_map = {
+              'fatal':      'error',
+              'error':      'error',
+              'warning':    'warning',
+              'convention': 'note',
+              'refactor':   'note',
+              'info':       'note',
+          }
+
+          try:
+              with open('rubocop.json', 'r') as f:
+                  data = json.load(f)
+
+              for file_info in data.get('files', []):
+                  file_path = file_info.get('path', 'unknown')
+                  for offense in file_info.get('offenses', []):
+                      severity    = offense.get('severity', 'warning')
+                      message_text = offense.get('message', 'No description')
+                      cop_name    = offense.get('cop_name', 'unknown')
+                      location    = offense.get('location', {})
+                      start_line  = location.get('start_line', location.get('line', 1))
+                      start_col   = location.get('start_column', location.get('column', 1))
+
+                      sarif["runs"][0]["results"].append({
+                          "ruleId": cop_name,
+                          "level": severity_map.get(severity, 'warning'),
+                          "message": {"text": f"[{cop_name}] {message_text}"},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": file_path},
+                                  "region": {
+                                      "startLine":   start_line or 1,
+                                      "startColumn": start_col or 1
+                                  }
+                              }
+                          }]
+                      })
+
+          except Exception as e:
+              raise SystemExit(f"Error processing RuboCop results: {e}")
+
+          with open('rubocop.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate RuboCop SARIF
+        if: always() && steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        run: |
+          set -euo pipefail
+          [ -s rubocop.sarif ] || { echo "::error::rubocop.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('rubocop.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::rubocop produced {n} finding(s)' if n else '::notice::rubocop completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_ruby.outputs.has_files == 'true' && inputs.enable_rubocop
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rubocop-sarif
+          path: rubocop.sarif
+          retention-days: 7
+
+  bundler-audit:
+    name: bundler-audit (Ruby Dependencies)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Uses inline bash rather than collect-paths: bundler-audit targets Gemfile.lock
+      # specifically (not source .rb files), and its per-directory invocation loop
+      # requires discovering each lock file's parent directory as the audit root.
+      - name: Check for Gemfile.lock changes
+        id: check_gemlock
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            find . -name 'Gemfile.lock' -not -path './.git/*' | sort > changed_gemlock_files.txt
+            if [ -s changed_gemlock_files.txt ]; then
+              echo "has_gemlock=true" >> "$GITHUB_OUTPUT"
+              echo "No PR context — auditing all Gemfile.lock files"
+            else
+              echo "has_gemlock=false" >> "$GITHUB_OUTPUT"
+              echo "No Gemfile.lock files found — skipping"
+            fi
+            exit 0
+          fi
+          DIFF_FILES=$(git diff --name-only --diff-filter=d "$PR_BASE_SHA" "$PR_HEAD_SHA") || {
+            echo "::warning::git diff failed — PR base SHA may be stale (force-push?). Falling back to tracked files."
+            DIFF_FILES=$(git ls-files)
+          }
+          CHANGED_FILES=$(echo "$DIFF_FILES" | grep -E 'Gemfile\.lock$' || echo "")
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_gemlock=true" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED_FILES" > changed_gemlock_files.txt
+            echo "Gemfile.lock files changed:"
+            cat changed_gemlock_files.txt
+          else
+            echo "has_gemlock=false" >> "$GITHUB_OUTPUT"
+            echo "No Gemfile.lock changed in this PR"
+          fi
+
+      - name: bundler-audit disabled
+        if: steps.check_gemlock.outputs.has_gemlock == 'true' && !inputs.enable_bundler_audit
+        run: |
+          echo '::notice title=Tool Disabled::bundler-audit is disabled. Set enable_bundler_audit: true to re-enable.'
+
+      - name: Set up Ruby
+        if: steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        uses: ruby/setup-ruby@09a7688d3b55cf0e976497ff046b70949eeaccfd # v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: Cache bundler-audit
+        if: steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.gem
+          key: ${{ runner.os }}-gems-bundler-audit-${{ hashFiles('.github/workflows/security-ruby.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-gems-bundler-audit-
+
+      - name: Install bundler-audit
+        if: steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        run: |
+          for i in 1 2 3; do
+            gem install bundler-audit:0.9.2 --no-document && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install bundler-audit after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run bundler-audit
+        id: run_bundler_audit
+        if: steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        continue-on-error: true
+        run: |
+          # --update fetches the latest ruby-advisory-db advisory database from GitHub before
+          # checking. Requires outbound access to raw.githubusercontent.com. If your runner
+          # uses egress-policy: block, add raw.githubusercontent.com to allowed-endpoints.
+          # Each Gemfile.lock is audited from its own directory so monorepos use the
+          # correct resolved dependency graph instead of assuming the repo root.
+          echo '[]' > bundler-audit-aggregated.json
+          targets_found=0
+          successful_runs=0
+          while IFS= read -r lock_file; do
+            [ -n "$lock_file" ] || continue
+            lock_file="${lock_file#./}"
+            lock_dir=$(dirname "$lock_file")
+            targets_found=$((targets_found + 1))
+            echo "Auditing $lock_file..."
+            (
+              cd "$lock_dir"
+              bundle-audit check --update --format json > bundler-audit-partial.json
+            ) || true
+            if [ -s "$lock_dir/bundler-audit-partial.json" ]; then
+              successful_runs=$((successful_runs + 1))
+              PARTIAL_FILE="$lock_dir/bundler-audit-partial.json" SOURCE_FILE="$lock_file" python3 << 'PYEOF'
+          import json, os
+
+          with open('bundler-audit-aggregated.json') as f:
+              existing = json.load(f)
+          with open(os.environ['PARTIAL_FILE']) as f:
+              data = json.load(f)
+
+          source_file = os.environ['SOURCE_FILE']
+          for result in data.get('results', []):
+              if not isinstance(result, dict):
+                  continue
+              row = dict(result)
+              row['_source_file'] = source_file
+              existing.append(row)
+
+          with open('bundler-audit-aggregated.json', 'w') as f:
+              json.dump(existing, f)
+          PYEOF
+              rm -f "$lock_dir/bundler-audit-partial.json"
+            else
+              rm -f "$lock_dir/bundler-audit-partial.json"
+            fi
+          done < changed_gemlock_files.txt
+
+          if [ "$targets_found" -gt 0 ] && [ "$successful_runs" -eq 0 ]; then
+            echo "::error::bundler-audit found $targets_found Gemfile.lock file(s) but all invocations failed — check bundler-audit installation"
+            exit 1
+          fi
+          mv bundler-audit-aggregated.json bundler-audit.json
+
+      - name: Check bundler-audit result
+        if: steps.run_bundler_audit.outcome == 'failure'
+        run: echo "::warning title=bundler-audit::bundler-audit exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        # Runs in both modes — python3 is needed by the SARIF conversion step below.
+        if: steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.run_bundler_audit.outcome != 'failure' && steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        run: |
+          python3 << 'EOF'
+          import json
+          import sys
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "bundler-audit",
+                          "version": "0.9.2",
+                          "informationUri": "https://github.com/rubysec/bundler-audit"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          def cvss_to_level(cvss_v3, cvss_v2):
+              """Map CVSS score to SARIF level. v3 is preferred over v2."""
+              score = cvss_v3 if cvss_v3 is not None else cvss_v2
+              if score is None:
+                  return 'warning'   # Unknown severity — default to warning
+              if score >= 9.0:
+                  return 'error'
+              if score >= 4.0:
+                  return 'warning'
+              return 'note'
+
+          try:
+              with open('bundler-audit.json', 'r') as f:
+                  data = json.load(f)
+
+              results = data if isinstance(data, list) else data.get('results', [])
+
+              skipped = 0
+              for result in results:
+                  try:
+                      # Only report UnpatchedGem entries. InsecureSource (http:// gem source)
+                      # is informational and does not represent a dependency vulnerability.
+                      if result.get('type') != 'unpatched_gem':
+                          continue
+
+                      gem      = result.get('gem', {})
+                      advisory = result.get('advisory', {})
+
+                      gem_name    = gem.get('name', 'unknown')
+                      gem_version = gem.get('version', 'unknown')
+                      advisory_id = advisory.get('id', advisory.get('ghsa', 'unknown'))
+                      cve         = advisory.get('cve', '')
+                      title       = advisory.get('title', 'Vulnerable dependency detected')
+                      url         = advisory.get('url', '')
+                      cvss_v3     = advisory.get('cvss_v3')
+                      cvss_v2     = advisory.get('cvss_v2')
+                      patched     = advisory.get('patched_versions', [])
+                      source_file = result.get('_source_file', 'Gemfile.lock')
+
+                      rule_id = cve if cve else advisory_id
+                      level   = cvss_to_level(cvss_v3, cvss_v2)
+
+                      message = f"Vulnerable gem: {gem_name} {gem_version} ({rule_id}): {title}"
+                      if patched:
+                          message += f". Fix: upgrade to {', '.join(patched)}"
+                      if url:
+                          message += f". See: {url}"
+
+                      sarif["runs"][0]["results"].append({
+                          "ruleId": rule_id,
+                          "level": level,
+                          "message": {"text": message},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": source_file},
+                                  "region": {"startLine": 1}
+                              }
+                          }]
+                      })
+                  except Exception:
+                      skipped += 1
+                      continue
+
+              if skipped:
+                  print(f"::warning::{skipped} malformed entries skipped during SARIF conversion", file=sys.stderr)
+
+          except Exception as e:
+              raise SystemExit(f"Error processing bundler-audit results: {e}")
+
+          with open('bundler-audit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate bundler-audit SARIF
+        if: always() && steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        run: |
+          set -euo pipefail
+          [ -s bundler-audit.sarif ] || { echo "::error::bundler-audit.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('bundler-audit.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::bundler-audit produced {n} finding(s)' if n else '::notice::bundler-audit completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_gemlock.outputs.has_gemlock == 'true' && inputs.enable_bundler_audit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bundler-audit-sarif
+          path: bundler-audit.sarif
+          retention-days: 7

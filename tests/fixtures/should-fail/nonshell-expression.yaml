@@ -1,0 +1,14 @@
+name: nonshell-expression
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event.issue.title }}
+    permissions:
+      contents: read
+    steps:
+      - run: echo safe

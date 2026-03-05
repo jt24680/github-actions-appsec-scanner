@@ -1,0 +1,77 @@
+name: Collect Changed Paths
+description: >
+  Produces a NUL-delimited manifest of repo paths matching include/exclude
+  regex filters. Uses git diff in PR mode, git ls-files otherwise.
+  Designed for use inside reusable workflows — ${{ github.action_path }}
+  ensures the bundled Python script is found regardless of which repo
+  called the workflow.
+
+inputs:
+  output:
+    description: Output file path for NUL-delimited paths
+    required: true
+  label:
+    description: Human-readable label for log messages (e.g. "Python", "SQL")
+    required: true
+  include-regex:
+    description: >
+      Regex pattern applied to repo-relative POSIX paths. Files matching
+      this pattern are included. Combine multiple patterns with | alternation.
+    required: true
+  exclude-regex:
+    description: >
+      Regex pattern applied after include filter. Files matching this
+      pattern are excluded. Combine multiple patterns with | alternation.
+      Leave empty to skip exclusion filtering.
+    required: false
+    default: ''
+  base-sha:
+    description: PR base commit SHA. Leave empty for full-repo scan.
+    required: false
+    default: ''
+  head-sha:
+    description: PR head commit SHA. Leave empty for full-repo scan.
+    required: false
+    default: ''
+
+outputs:
+  has_files:
+    description: "'true' if any matching files were found, 'false' otherwise"
+    value: ${{ steps.collect.outputs.has_files }}
+
+runs:
+  using: composite
+  steps:
+    - id: collect
+      shell: bash
+      env:
+        COLLECT_OUTPUT: ${{ inputs.output }}
+        COLLECT_LABEL: ${{ inputs.label }}
+        COLLECT_INCLUDE: ${{ inputs.include-regex }}
+        COLLECT_EXCLUDE: ${{ inputs.exclude-regex }}
+        COLLECT_BASE_SHA: ${{ inputs.base-sha }}
+        COLLECT_HEAD_SHA: ${{ inputs.head-sha }}
+      run: |
+        # Preflight: ensure python3 is available.
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "::error::python3 is required but not found on this runner."
+          exit 1
+        fi
+        # Build argument list for the bundled Python script.
+        ARGS=(
+          --output "$COLLECT_OUTPUT"
+          --label "$COLLECT_LABEL"
+          --include-regex "$COLLECT_INCLUDE"
+        )
+        if [ -n "$COLLECT_EXCLUDE" ]; then
+          ARGS+=(--exclude-regex "$COLLECT_EXCLUDE")
+        fi
+        ARGS+=(--base-sha "$COLLECT_BASE_SHA" --head-sha "$COLLECT_HEAD_SHA")
+
+        python3 "${{ github.action_path }}/collect_paths.py" "${ARGS[@]}"
+
+        if [ -s "$COLLECT_OUTPUT" ]; then
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_files=false" >> "$GITHUB_OUTPUT"
+        fi

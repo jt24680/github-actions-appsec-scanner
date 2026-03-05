@@ -1,0 +1,13 @@
+name: AppSec Reusable Full Scan
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: your-org/github-actions-appsec-scanner/.github/workflows/orchestrator-reusable.yaml@main  # zizmor:ignore[unpinned-uses]
+    with:
+      scanners: all
+      disabled_tools: syft

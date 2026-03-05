@@ -1,0 +1,25 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+tests/tmp/
+tests/*.log
+*.sarif
+act-output/
+
+# Secrets / local config
+.env
+*.pem
+*.key
+
+# Others
+.claude/
+__pycache__/
+*.pyc

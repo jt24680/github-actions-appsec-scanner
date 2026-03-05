@@ -1,0 +1,8 @@
+{
+  "name": "fixture-license-copyleft-positive",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ghostscript4js": "3.2.1"
+  }
+}

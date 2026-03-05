@@ -1,0 +1,5 @@
+apiVersion: v2
+name: test-app
+description: Minimal Helm chart fixture for security scanning tests.
+version: 0.1.0
+appVersion: "1.0.0"

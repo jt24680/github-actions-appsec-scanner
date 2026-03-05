@@ -1,0 +1,555 @@
+name: Rust Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_cargo_audit:
+        type: boolean
+        default: true
+      enable_clippy:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: Cargo Audit (Rust)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # NOTE: GitHub Actions has no step-level sharing across jobs, so this detection
+      # step is intentionally duplicated for each job in this workflow. Update all
+      # copies when the detection logic changes.
+      # Uses inline Python rather than collect-paths because it must discover Cargo
+      # workspace roots and partition changed files per workspace — logic that exceeds
+      # what collect-paths's regex filter supports.
+      - name: Check for changed Rust files
+        id: check_rust
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          python3 << 'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+
+          repo_root = Path(".")
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          base_sha = os.environ.get("PR_BASE_SHA", "")
+          head_sha = os.environ.get("PR_HEAD_SHA", "")
+
+          def repo_rel(path: Path) -> str:
+              rel = path.as_posix().lstrip("./")
+              return rel or "."
+
+          def cargo_roots():
+              roots = []
+              for cargo_toml in repo_root.rglob("Cargo.toml"):
+                  if ".git" in cargo_toml.parts:
+                      continue
+                  roots.append(repo_rel(cargo_toml.parent))
+              return sorted(set(roots))
+
+          def locate_project(changed_path: str):
+              current = Path(changed_path)
+              if not current.parts:
+                  return None
+              search = current if current.is_dir() else current.parent
+              while True:
+                  if (search / "Cargo.toml").is_file():
+                      return repo_rel(search)
+                  if search == repo_root:
+                      return None
+                  search = search.parent
+
+          if not base_sha or not head_sha:
+              projects = cargo_roots()
+              changed = []
+          else:
+              try:
+                  diff = subprocess.check_output(
+                      ["git", "diff", "--name-only", "--diff-filter=d", base_sha, head_sha],
+                      text=True,
+                  )
+                  changed = [line for line in diff.splitlines() if line]
+              except subprocess.CalledProcessError:
+                  diff = subprocess.check_output(["git", "ls-files"], text=True)
+                  changed = [line for line in diff.splitlines() if line]
+
+              projects = []
+              for changed_path in changed:
+                  if not changed_path.endswith((".rs", "Cargo.toml", "Cargo.lock")):
+                      continue
+                  project_root = locate_project(changed_path)
+                  if project_root:
+                      projects.append(project_root)
+              projects = sorted(set(projects))
+
+          with open("rust-project-roots.txt", "w", encoding="utf-8") as handle:
+              for project in projects:
+                  handle.write(project + "\n")
+
+          with output_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"has_rust={'true' if projects else 'false'}\n")
+
+          if projects:
+              print("Rust project roots:")
+              for project in projects:
+                  print(project)
+              if changed:
+                  print("Rust-related changed files:")
+                  for changed_path in changed:
+                      if changed_path.endswith((".rs", "Cargo.toml", "Cargo.lock")):
+                          print(changed_path)
+          elif changed:
+              print("No Rust project roots matched the changed files in this PR")
+          else:
+              print("No Rust projects found — skipping")
+          PY
+
+      - name: cargo-audit disabled
+        if: steps.check_rust.outputs.has_rust == 'true' && !inputs.enable_cargo_audit
+        run: |
+          echo '::notice title=Tool Disabled::cargo-audit is disabled. Set enable_cargo_audit: true to re-enable.'
+
+      - name: Install Rust toolchain
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: '1.85.0'
+
+      - name: Cache cargo registry
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        run: |
+          for i in 1 2 3; do
+            cargo install cargo-audit --version 0.22.1 --locked && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install cargo-audit after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run cargo-audit
+        id: run_cargo_audit
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        continue-on-error: true
+        run: |
+          : > cargo-audit-manifest.txt
+          project_count=0
+          successful_runs=0
+          while IFS= read -r project_root; do
+            [ -n "$project_root" ] || continue
+            project_count=$((project_count + 1))
+            output_file="cargo-audit-${project_count}.json"
+            echo "Auditing Rust project at $project_root..."
+            (
+              cd "$project_root"
+              cargo audit --json > "$GITHUB_WORKSPACE/$output_file"
+            ) || true
+            if [ -s "$output_file" ]; then
+              successful_runs=$((successful_runs + 1))
+              echo "${project_root}|${output_file}" >> cargo-audit-manifest.txt
+            else
+              rm -f "$output_file"
+            fi
+          done < rust-project-roots.txt
+
+          if [ "$project_count" -gt 0 ] && [ "$successful_runs" -eq 0 ]; then
+            echo "::error::cargo-audit found $project_count Rust project(s) but all invocations failed"
+            exit 1
+          fi
+
+      - name: Check cargo-audit result
+        if: steps.run_cargo_audit.outcome == 'failure'
+        run: echo "::warning title=cargo-audit::cargo-audit exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: always() && steps.run_cargo_audit.outcome != 'failure' && steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        run: |
+          python3 << 'EOF'
+          import json
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "cargo-audit",
+                          "informationUri": "https://rustsec.org/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('cargo-audit-manifest.txt', 'r', encoding='utf-8') as manifest:
+                  entries = [line.strip().split('|', 1) for line in manifest if line.strip()]
+
+              for project_root, audit_file in entries:
+                  with open(audit_file, 'r', encoding='utf-8') as f:
+                      data = json.load(f)
+
+                  vulnerabilities = data.get('vulnerabilities', {}).get('list', [])
+                  cargo_toml = 'Cargo.toml' if project_root == '.' else f"{project_root}/Cargo.toml"
+
+                  for vuln in vulnerabilities:
+                      advisory = vuln.get('advisory', {})
+                      package = vuln.get('package', {})
+
+                      advisory_id = advisory.get('id', 'unknown')
+                      title = advisory.get('title', 'No description')
+                      cvss = advisory.get('cvss', None)
+                      pkg_name = package.get('name', 'unknown')
+                      pkg_version = package.get('version', 'unknown')
+                      url = advisory.get('url', '')
+
+                      if cvss:
+                          # advisory.cvss is a CVSS v3 vector string, not a float.
+                          # Use the advisory.severity field (derived from the vector
+                          # by cargo-audit) for reliable severity classification.
+                          severity_str = advisory.get('severity', '').lower()
+                          sev_map = {'none': 'note', 'low': 'note', 'medium': 'warning',
+                                     'high': 'error', 'critical': 'error'}
+                          level = sev_map.get(severity_str, 'warning')
+                      else:
+                          level = 'warning'
+
+                      message = f"Vulnerable dependency: {pkg_name} {pkg_version} - {title}"
+                      if url:
+                          message += f". Advisory: {url}"
+
+                      result = {
+                          "ruleId": advisory_id,
+                          "level": level,
+                          "message": {"text": message},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": cargo_toml},
+                                  "region": {"startLine": 1}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+
+          except Exception as e:
+              raise SystemExit(f"Error processing cargo-audit results: {e}")
+
+          with open('cargo-audit.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate cargo-audit SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        run: |
+          set -euo pipefail
+          [ -s cargo-audit.sarif ] || { echo "::error::cargo-audit.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('cargo-audit.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::cargo-audit produced {n} finding(s)' if n else '::notice::cargo-audit completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true' && inputs.enable_cargo_audit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cargo-audit-sarif
+          path: cargo-audit.sarif
+          retention-days: 7
+
+  clippy:
+    name: Clippy (Rust Linting)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # NOTE: GitHub Actions has no step-level sharing across jobs, so this detection
+      # step is intentionally duplicated for each job in this workflow. Update all
+      # copies when the detection logic changes.
+      # Uses inline Python rather than collect-paths because it must discover Cargo
+      # workspace roots and partition changed files per workspace — logic that exceeds
+      # what collect-paths's regex filter supports.
+      - name: Check for changed Rust files
+        id: check_rust
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          python3 << 'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+
+          repo_root = Path(".")
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          base_sha = os.environ.get("PR_BASE_SHA", "")
+          head_sha = os.environ.get("PR_HEAD_SHA", "")
+
+          def repo_rel(path: Path) -> str:
+              rel = path.as_posix().lstrip("./")
+              return rel or "."
+
+          def cargo_roots():
+              roots = []
+              for cargo_toml in repo_root.rglob("Cargo.toml"):
+                  if ".git" in cargo_toml.parts:
+                      continue
+                  roots.append(repo_rel(cargo_toml.parent))
+              return sorted(set(roots))
+
+          def locate_project(changed_path: str):
+              current = Path(changed_path)
+              if not current.parts:
+                  return None
+              search = current if current.is_dir() else current.parent
+              while True:
+                  if (search / "Cargo.toml").is_file():
+                      return repo_rel(search)
+                  if search == repo_root:
+                      return None
+                  search = search.parent
+
+          if not base_sha or not head_sha:
+              projects = cargo_roots()
+              changed = []
+          else:
+              try:
+                  diff = subprocess.check_output(
+                      ["git", "diff", "--name-only", "--diff-filter=d", base_sha, head_sha],
+                      text=True,
+                  )
+                  changed = [line for line in diff.splitlines() if line]
+              except subprocess.CalledProcessError:
+                  diff = subprocess.check_output(["git", "ls-files"], text=True)
+                  changed = [line for line in diff.splitlines() if line]
+
+              projects = []
+              for changed_path in changed:
+                  if not changed_path.endswith((".rs", "Cargo.toml", "Cargo.lock")):
+                      continue
+                  project_root = locate_project(changed_path)
+                  if project_root:
+                      projects.append(project_root)
+              projects = sorted(set(projects))
+
+          with open("rust-project-roots.txt", "w", encoding="utf-8") as handle:
+              for project in projects:
+                  handle.write(project + "\n")
+
+          with output_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"has_rust={'true' if projects else 'false'}\n")
+
+          if projects:
+              print("Rust project roots:")
+              for project in projects:
+                  print(project)
+              if changed:
+                  print("Rust-related changed files:")
+                  for changed_path in changed:
+                      if changed_path.endswith((".rs", "Cargo.toml", "Cargo.lock")):
+                          print(changed_path)
+          elif changed:
+              print("No Rust project roots matched the changed files in this PR")
+          else:
+              print("No Rust projects found — skipping")
+          PY
+
+      - name: Clippy disabled
+        if: steps.check_rust.outputs.has_rust == 'true' && !inputs.enable_clippy
+        run: |
+          echo '::notice title=Tool Disabled::Clippy is disabled. Set enable_clippy: true to re-enable.'
+
+      - name: Install Rust toolchain with clippy
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_clippy
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: '1.85.0'
+          components: clippy
+
+      - name: Cache cargo registry
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_clippy
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+
+      - name: Run Clippy
+        id: run_clippy
+        if: steps.check_rust.outputs.has_rust == 'true' && inputs.enable_clippy
+        continue-on-error: true
+        run: |
+          : > clippy-manifest.txt
+          project_count=0
+          successful_runs=0
+          while IFS= read -r project_root; do
+            [ -n "$project_root" ] || continue
+            project_count=$((project_count + 1))
+            output_file="clippy-${project_count}.jsonl"
+            echo "Running Clippy for Rust project at $project_root..."
+            (
+              cd "$project_root"
+              cargo clippy --all-targets --message-format=json
+            ) > "$output_file" 2>/dev/null || true
+            if [ -s "$output_file" ]; then
+              successful_runs=$((successful_runs + 1))
+              echo "${project_root}|${output_file}" >> clippy-manifest.txt
+            else
+              rm -f "$output_file"
+            fi
+          done < rust-project-roots.txt
+
+          if [ "$project_count" -gt 0 ] && [ "$successful_runs" -eq 0 ]; then
+            echo "::error::clippy found $project_count Rust project(s) but all invocations failed"
+            exit 1
+          fi
+
+      - name: Check Clippy result
+        if: steps.run_clippy.outcome == 'failure'
+        run: echo "::warning title=Clippy::Clippy exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: always() && steps.run_clippy.outcome != 'failure' && steps.check_rust.outputs.has_rust == 'true' && inputs.enable_clippy
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Clippy",
+                          "informationUri": "https://rust-lang.github.io/rust-clippy/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              import os
+              from pathlib import Path
+
+              workspace = Path(os.environ.get('GITHUB_WORKSPACE', os.getcwd())).resolve()
+              with open('clippy-manifest.txt', 'r', encoding='utf-8') as manifest:
+                  entries = [line.strip().split('|', 1) for line in manifest if line.strip()]
+
+              for project_root, audit_file in entries:
+                  with open(audit_file, 'r', encoding='utf-8') as f:
+                      for line in f:
+                          try:
+                              msg = json.loads(line.strip())
+                          except Exception:
+                              continue
+
+                          if msg.get('reason') != 'compiler-message':
+                              continue
+
+                          compiler_msg = msg.get('message', {})
+                          level_str = compiler_msg.get('level', 'warning')
+                          if level_str not in ('warning', 'error'):
+                              continue
+
+                          code = compiler_msg.get('code', {})
+                          rule_id = code.get('code', 'unknown') if code else 'unknown'
+                          message_text = compiler_msg.get('message', 'No description')
+
+                          level_map = {'error': 'error', 'warning': 'warning'}
+                          sarif_level = level_map.get(level_str, 'warning')
+
+                          spans = compiler_msg.get('spans', [])
+                          primary_span = next((s for s in spans if s.get('is_primary')), spans[0] if spans else None)
+
+                          if primary_span:
+                              raw_path = primary_span.get('file_name', 'unknown')
+                              start_line = primary_span.get('line_start', 1)
+                              start_col = primary_span.get('column_start', 1)
+                              if raw_path == 'unknown':
+                                  filepath = raw_path
+                              else:
+                                  file_path = Path(raw_path)
+                                  if file_path.is_absolute():
+                                      filepath = os.path.relpath(file_path, workspace)
+                                  elif project_root == '.':
+                                      filepath = os.path.normpath(raw_path)
+                                  else:
+                                      filepath = os.path.normpath(os.path.join(project_root, raw_path))
+                          else:
+                              filepath = 'unknown'
+                              start_line = 1
+                              start_col = 1
+
+                          result = {
+                              "ruleId": rule_id,
+                              "level": sarif_level,
+                              "message": {"text": message_text},
+                              "locations": [{
+                                  "physicalLocation": {
+                                      "artifactLocation": {"uri": filepath},
+                                      "region": {"startLine": start_line, "startColumn": start_col}
+                                  }
+                              }]
+                          }
+                          sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing Clippy results: {e}")
+
+          with open('clippy.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate Clippy SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true' && inputs.enable_clippy
+        run: |
+          set -euo pipefail
+          [ -s clippy.sarif ] || { echo "::error::clippy.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('clippy.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::clippy produced {n} finding(s)' if n else '::notice::clippy completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_rust.outputs.has_rust == 'true' && inputs.enable_clippy
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clippy-sarif
+          path: clippy.sarif
+          retention-days: 7

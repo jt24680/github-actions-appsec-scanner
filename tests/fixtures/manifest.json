@@ -1,0 +1,474 @@
+{
+  "fixtures": [
+    {
+      "id": "common/docs-only",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "_orchestrator-ci"
+      ],
+      "description": "Negative fixture with documentation only."
+    },
+    {
+      "id": "python/bandit-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-python",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "src/python/app.py"
+      ],
+      "description": "Tiny Python fixture that triggers Bandit routing."
+    },
+    {
+      "id": "java/pmd-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-java",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "src/main/java/com/example/App.java"
+      ],
+      "description": "Minimal Java fixture for PMD."
+    },
+    {
+      "id": "dotnet/basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-dotnet",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "src/App/App.csproj",
+        "src/App/Program.cs"
+      ],
+      "description": "Minimal .NET fixture for dotnet audit."
+    },
+    {
+      "id": "js/npm-basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-js",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "package.json",
+        "package-lock.json",
+        "index.js"
+      ],
+      "description": "Minimal JS package fixture for npm audit routing."
+    },
+    {
+      "id": "sql/basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-sql",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "query.sql"
+      ],
+      "description": "Minimal SQL fixture for SQLFluff and TSQLLint."
+    },
+    {
+      "id": "iac/checkov-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "main.tf"
+      ],
+      "description": "Minimal Terraform fixture for Checkov routing."
+    },
+    {
+      "id": "iac/ansible-lint-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "site.yml",
+        "playbooks/deploy.yml"
+      ],
+      "description": "Minimal Ansible fixture for ansible-lint routing."
+    },
+    {
+      "id": "go/basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-go",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "go.mod",
+        "main.go"
+      ],
+      "description": "Minimal Go fixture for gosec and govulncheck routing."
+    },
+    {
+      "id": "rust/basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-rust",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/main.rs"
+      ],
+      "description": "Minimal Rust fixture for cargo-audit and Clippy routing."
+    },
+    {
+      "id": "c/basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-c",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "main.c"
+      ],
+      "description": "Minimal C fixture for flawfinder and cppcheck routing."
+    },
+    {
+      "id": "c/cpp-only-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "main.cpp"
+      ],
+      "description": "Minimal C++ fixture used for changed-file routing tests."
+    },
+    {
+      "id": "ruby/basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-ruby",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "app.rb",
+        "Gemfile",
+        "Gemfile.lock"
+      ],
+      "description": "Minimal Ruby fixture for RuboCop and bundler-audit routing."
+    },
+    {
+      "id": "rails/basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-rails",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "config/application.rb",
+        "app/controllers/application_controller.rb",
+        "Gemfile",
+        "Gemfile.lock"
+      ],
+      "description": "Minimal Rails fixture for Brakeman routing."
+    },
+    {
+      "id": "php/basic",
+      "class": "bounded-drift",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-php",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "index.php",
+        "composer.json",
+        "composer.lock"
+      ],
+      "description": "Minimal PHP fixture for PHPStan and composer audit routing."
+    },
+    {
+      "id": "powershell/basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-powershell",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "script.ps1"
+      ],
+      "description": "Minimal PowerShell fixture for PSScriptAnalyzer routing."
+    },
+    {
+      "id": "general/semgrep-basic-positive",
+      "class": "deterministic",
+      "assertion_mode": "minimum",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "src/app.py"
+      ],
+      "description": "Tiny Semgrep-positive fixture with an obvious insecure pattern."
+    },
+    {
+      "id": "general/semgrep-basic-negative",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "src/app.py"
+      ],
+      "description": "Semgrep-negative fixture with clean code."
+    },
+    {
+      "id": "general/trufflehog-fake-secret-positive",
+      "class": "deterministic",
+      "assertion_mode": "minimum",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "secrets.txt"
+      ],
+      "description": "Fake secret fixture for TruffleHog detection coverage."
+    },
+    {
+      "id": "general/trufflehog-clean-negative",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "README.md"
+      ],
+      "description": "Negative TruffleHog fixture with no secret-like material."
+    },
+    {
+      "id": "iac/dockerfile-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "Dockerfile"
+      ],
+      "description": "Minimal Dockerfile fixture for Hadolint routing."
+    },
+    {
+      "id": "iac/k8s-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "k8s/deployment.yaml"
+      ],
+      "description": "Minimal Kubernetes manifest fixture for KubeLinter routing."
+    },
+    {
+      "id": "github-actions/actionlint-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-github-actions"
+      ],
+      "expected_paths": [
+        ".github/workflows/ci.yaml"
+      ],
+      "description": "Minimal GitHub Actions workflow fixture for actionlint routing."
+    },
+    {
+      "id": "general/gitleaks-fake-secret-positive",
+      "class": "deterministic",
+      "assertion_mode": "minimum",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "secrets.env"
+      ],
+      "description": "Fake secret fixture for Gitleaks detection coverage."
+    },
+    {
+      "id": "general/gitleaks-clean-negative",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "README.md"
+      ],
+      "description": "Negative Gitleaks fixture with no secret-like material."
+    },
+    {
+      "id": "iac/kubescape-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "k8s/deployment.yaml"
+      ],
+      "description": "Minimal Kubernetes manifest fixture for Kubescape routing."
+    },
+    {
+      "id": "iac/pluto-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "k8s/ingress.yaml"
+      ],
+      "description": "Kubernetes manifest with deprecated API version for Pluto routing."
+    },
+    {
+      "id": "iac/cloudformation-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "cloudformation/template.yaml"
+      ],
+      "description": "Minimal CloudFormation fixture for Checkov routing."
+    },
+    {
+      "id": "iac/helm-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-iac",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        "helm/Chart.yaml",
+        "helm/values.yaml",
+        "helm/templates/deployment.yaml"
+      ],
+      "description": "Minimal Helm chart fixture for Checkov, KubeLinter, and Kubescape routing."
+    },
+    {
+      "id": "general/trivy-vuln-positive",
+      "class": "bounded-drift",
+      "assertion_mode": "minimum",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "requirements.txt",
+        "app.py"
+      ],
+      "description": "Python fixture with known-vulnerable dependency for Trivy detection."
+    },
+    {
+      "id": "general/grype-vuln-positive",
+      "class": "bounded-drift",
+      "assertion_mode": "minimum",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "package.json",
+        "package-lock.json"
+      ],
+      "description": "JS fixture with known-vulnerable dependency for Grype detection."
+    },
+    {
+      "id": "general/license-copyleft-positive",
+      "class": "bounded-drift",
+      "assertion_mode": "minimum",
+      "workflows": [
+        "_security-general"
+      ],
+      "expected_paths": [
+        "package.json",
+        "package-lock.json"
+      ],
+      "description": "Fixture with copyleft-licensed dependency for license-scan detection."
+    },
+    {
+      "id": "orchestrator/reusable-pr-mode",
+      "class": "github-native",
+      "assertion_mode": "shape",
+      "workflows": [
+        "orchestrator-reusable"
+      ],
+      "expected_paths": [
+        ".github/workflows/appsec.yaml"
+      ],
+      "description": "Minimal external caller workflow that invokes the reusable orchestrator in PR-aware mode."
+    },
+    {
+      "id": "orchestrator/reusable-full-scan",
+      "class": "github-native",
+      "assertion_mode": "shape",
+      "workflows": [
+        "orchestrator-reusable"
+      ],
+      "expected_paths": [
+        ".github/workflows/appsec.yaml"
+      ],
+      "description": "Minimal external caller workflow that invokes the reusable orchestrator in full-scan workflow_dispatch mode."
+    },
+    {
+      "id": "github-actions/zizmor-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-github-actions",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        ".github/workflows/vulnerable.yaml"
+      ],
+      "description": "GHA workflow with template injection — positive fixture for zizmor."
+    },
+    {
+      "id": "github-actions/poutine-basic",
+      "class": "deterministic",
+      "assertion_mode": "shape",
+      "workflows": [
+        "security-github-actions",
+        "_orchestrator-ci"
+      ],
+      "expected_paths": [
+        ".github/workflows/unpinned.yaml"
+      ],
+      "description": "GHA workflow with unpinned action refs — positive fixture for poutine."
+    }
+  ]
+}

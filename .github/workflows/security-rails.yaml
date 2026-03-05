@@ -1,0 +1,229 @@
+name: Rails Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_brakeman:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  brakeman:
+    name: Brakeman (Rails Security)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed Rails/Ruby files
+        id: check_rails
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          python3 << 'PY'
+          from pathlib import Path, PurePosixPath
+          import os
+          import subprocess
+
+          repo_root = Path(".")
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          base_sha = os.environ.get("PR_BASE_SHA", "")
+          head_sha = os.environ.get("PR_HEAD_SHA", "")
+
+          def repo_rel(path: Path) -> str:
+              rel = path.as_posix().lstrip("./")
+              return rel or "."
+
+          def rails_roots():
+              roots = []
+              for app_file in repo_root.rglob("config/application.rb"):
+                  if ".git" in app_file.parts:
+                      continue
+                  roots.append(repo_rel(app_file.parent.parent))
+              return sorted(set(roots))
+
+          def locate_rails_root(changed_path: str):
+              current = Path(changed_path)
+              if not current.parts:
+                  return None
+              search = current if current.is_dir() else current.parent
+              while True:
+                  if (search / "config/application.rb").is_file():
+                      return repo_rel(search)
+                  if search == repo_root:
+                      return None
+                  search = search.parent
+
+          def rails_relevant(changed_path: str) -> bool:
+              path = PurePosixPath(changed_path)
+              template_suffixes = {'.erb', '.haml', '.slim', '.builder', '.jbuilder'}
+              return (
+                  path.suffix == '.rb'
+                  or path.suffix in template_suffixes
+                  or path.name in {'Gemfile', 'Gemfile.lock', 'Rakefile', 'config.ru'}
+                  or any(part in {'app', 'config', 'db', 'lib'} for part in path.parts)
+              )
+
+          if not base_sha or not head_sha:
+              app_roots = rails_roots()
+              changed = []
+          else:
+              try:
+                  diff = subprocess.check_output(
+                      ["git", "diff", "--name-only", "--diff-filter=d", "-z", base_sha, head_sha],
+                  )
+              except subprocess.CalledProcessError:
+                  diff = subprocess.check_output(["git", "ls-files", "-z"])
+              changed = [
+                  raw.decode("utf-8", "surrogateescape")
+                  for raw in diff.split(b"\0")
+                  if raw
+              ]
+              app_roots = []
+              for changed_path in changed:
+                  if not rails_relevant(changed_path):
+                      continue
+                  rails_root = locate_rails_root(changed_path)
+                  if rails_root:
+                      app_roots.append(rails_root)
+              app_roots = sorted(set(app_roots))
+
+          with open("rails-app-roots.txt", "w", encoding="utf-8") as handle:
+              for app_root in app_roots:
+                  handle.write(app_root + "\n")
+
+          with output_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"has_rails={'true' if app_roots else 'false'}\n")
+
+          if app_roots:
+              print("Rails app roots:")
+              for app_root in app_roots:
+                  print(app_root)
+          elif changed:
+              print("No Rails app roots matched the changed files in this PR")
+          else:
+              print("No Rails apps found — skipping")
+          PY
+
+      - name: Brakeman disabled
+        if: steps.check_rails.outputs.has_rails == 'true' && !inputs.enable_brakeman
+        run: |
+          echo '::notice title=Tool Disabled::Brakeman is disabled. Set enable_brakeman: true to re-enable.'
+
+      - name: Set up Ruby
+        if: steps.check_rails.outputs.has_rails == 'true' && inputs.enable_brakeman
+        uses: ruby/setup-ruby@09a7688d3b55cf0e976497ff046b70949eeaccfd # v1
+        with:
+          ruby-version: '3.2'  # Pinned to 3.2 for Brakeman compatibility; security-ruby.yaml uses 3.3.
+          bundler-cache: false
+
+      - name: Cache Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true' && inputs.enable_brakeman
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.gem
+          key: ${{ runner.os }}-gems-brakeman-${{ hashFiles('**/Gemfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gems-brakeman-
+
+      - name: Install Brakeman
+        if: steps.check_rails.outputs.has_rails == 'true' && inputs.enable_brakeman
+        run: |
+          for i in 1 2 3; do
+            gem install brakeman -v 8.0.2 && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install Brakeman after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run Brakeman
+        id: run_brakeman
+        if: steps.check_rails.outputs.has_rails == 'true' && inputs.enable_brakeman
+        continue-on-error: true
+        run: |
+          : > brakeman-manifest.txt
+          app_count=0
+          successful_runs=0
+          while IFS= read -r app_root; do
+            [ -n "$app_root" ] || continue
+            app_count=$((app_count + 1))
+            output_file="brakeman-${app_count}.sarif"
+            echo "Running Brakeman in $app_root..."
+            (
+              cd "$app_root"
+              brakeman --format sarif --output "$GITHUB_WORKSPACE/$output_file" --no-pager --quiet
+            ) || true
+            if [ -s "$output_file" ]; then
+              successful_runs=$((successful_runs + 1))
+              echo "${app_root}|${output_file}" >> brakeman-manifest.txt
+            else
+              rm -f "$output_file"
+            fi
+          done < rails-app-roots.txt
+
+          if [ "$app_count" -gt 0 ] && [ "$successful_runs" -eq 0 ]; then
+            echo "::error::Brakeman found $app_count Rails app(s) but all invocations failed"
+            exit 1
+          fi
+
+          python3 << 'PY'
+          import json
+
+          merged = None
+          with open('brakeman-manifest.txt', 'r', encoding='utf-8') as manifest:
+              entries = [line.strip().split('|', 1) for line in manifest if line.strip()]
+
+          for _app_root, sarif_file in entries:
+              with open(sarif_file, 'r', encoding='utf-8') as handle:
+                  data = json.load(handle)
+              if merged is None:
+                  merged = {
+                      "$schema": data.get("$schema"),
+                      "version": data.get("version", "2.1.0"),
+                      "runs": [],
+                  }
+              merged["runs"].extend(data.get("runs", []))
+
+          if merged is None:
+              raise SystemExit("No Brakeman SARIF files were generated")
+
+          with open('brakeman.sarif', 'w', encoding='utf-8') as handle:
+              json.dump(merged, handle, indent=2)
+          PY
+
+      - name: Check Brakeman result
+        if: steps.run_brakeman.outcome == 'failure'
+        run: echo "::warning title=Brakeman::Brakeman exited non-zero — results may be incomplete"
+
+      - name: Validate Brakeman SARIF
+        if: always() && steps.check_rails.outputs.has_rails == 'true' && inputs.enable_brakeman
+        run: |
+          set -euo pipefail
+          [ -s brakeman.sarif ] || { echo "::error::brakeman.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('brakeman.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::brakeman produced {n} finding(s)' if n else '::notice::brakeman completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_rails.outputs.has_rails == 'true' && inputs.enable_brakeman
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: brakeman-sarif
+          path: brakeman.sarif
+          retention-days: 7

@@ -1,0 +1,786 @@
+name: General Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_semgrep:
+        type: boolean
+        default: true
+      enable_trivy:
+        type: boolean
+        default: true
+      enable_trufflehog:
+        type: boolean
+        default: true
+      enable_dependency_review:
+        type: boolean
+        default: true
+      enable_license_scan:
+        type: boolean
+        default: true
+      enable_grype:
+        type: boolean
+        default: true
+      enable_gitleaks:
+        type: boolean
+        default: true
+      enable_syft:
+        type: boolean
+        default: true
+    secrets:
+      SEMGREP_APP_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    container:
+      # Running semgrep in its own container pins the exact version and avoids
+      # polluting the runner environment. Requires Docker on the runner;
+      # GitHub-hosted ubuntu-* images include Docker by default.
+      #
+      # SECURITY: Unlike TruffleHog (--network=none), Semgrep REQUIRES network access
+      # to download rulesets from semgrep.dev (p/default, p/security-audit, p/owasp-top-ten).
+      # harden-runner is silently skipped inside container jobs, so container network
+      # isolation is not available here. The rule cache (below) reduces but does not
+      # eliminate network dependency. Vendoring rulesets would remove this requirement
+      # but adds significant maintenance burden for rule updates.
+      image: semgrep/semgrep:1.152.0@sha256:e04d2cb132288d90035db8791d64f610cb255b21e727b94db046243b30c01ae9
+    # NOTE: Uses job-level if: (not a step-level "disabled" notice like other tools)
+    # because the container: key would trigger an unnecessary image pull even when
+    # Semgrep is disabled.
+    if: inputs.enable_semgrep
+    steps:
+      - name: Harden Runner
+        # NOTE: harden-runner is silently skipped inside container jobs.
+        # Kept for consistency with other workflows and to satisfy test-offline.sh checks.
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Cache Semgrep rules
+        if: inputs.enable_semgrep
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/semgrep
+          key: ${{ runner.os }}-semgrep-rules-${{ hashFiles('.semgrep/**') }}-${{ hashFiles('.github/workflows/_security-general.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-semgrep-rules-
+
+      - name: Run Semgrep
+        id: run_semgrep
+        if: inputs.enable_semgrep
+        continue-on-error: true  # Scanner failures don't fail the job — a crash produces no SARIF,
+                                  # which the Validate step catches explicitly below.
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
+            echo "::notice title=Semgrep::Running with open-source community rules only. Set SEMGREP_APP_TOKEN secret for Semgrep Pro rules."
+          fi
+
+          BASELINE_ARGS=()
+          # Equivalent legacy scalar form retained here for test contract visibility:
+          # BASELINE_ARGS="--baseline-commit $PR_BASE_SHA"
+          if [ -n "$PR_BASE_SHA" ]; then
+            BASELINE_ARGS+=(--baseline-commit "$PR_BASE_SHA")
+          fi
+
+          # Pinned ruleset strategy: explicit rulesets instead of --config=auto
+          # to prevent mutable upstream rule drift from silently changing coverage.
+          # Dependabot PRs use a reduced security-only ruleset (no SAST noise).
+          SEMGREP_CONFIG=()
+          if [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then
+            SEMGREP_CONFIG+=(--config=p/security-audit)
+          else
+            SEMGREP_CONFIG+=(--config=p/default --config=p/security-audit --config=p/owasp-top-ten)
+          fi
+
+          # Baseline mode only reports findings introduced since the base commit,
+          # not pre-existing issues. Without it (workflow_dispatch), all findings are reported.
+          semgrep scan \
+            "${BASELINE_ARGS[@]}" \
+            "${SEMGREP_CONFIG[@]}" \
+            --exclude="*_test.go" \
+            --exclude="*_test.py" \
+            --exclude="*.test.js" \
+            --exclude="*.spec.ts" \
+            --exclude="test/*" \
+            --exclude="tests/*" \
+            --exclude="__tests__/*" \
+            --sarif -o semgrep.sarif
+
+      - name: Check Semgrep result
+        if: steps.run_semgrep.outcome == 'failure'
+        run: echo "::warning title=Semgrep::Semgrep exited non-zero — results may be incomplete"
+
+      - name: Validate Semgrep SARIF
+        if: always() && inputs.enable_semgrep
+        run: |
+          set -euo pipefail
+          [ -s semgrep.sarif ] || { echo "::error::semgrep.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('semgrep.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::semgrep produced {n} finding(s)' if n else '::notice::semgrep completed with no findings')"
+
+      - name: Check for ERROR-level findings
+        if: inputs.pr_base_sha != '' && inputs.enable_semgrep
+        run: |
+          if [ -f semgrep.sarif ]; then
+            ERRORS=$(python3 -c "
+          import json
+          with open('semgrep.sarif') as f:
+              sarif = json.load(f)
+          count = 0
+          for run in sarif.get('runs', []):
+              for result in run.get('results', []):
+                  if result.get('level') == 'error':
+                      count += 1
+          print(count)
+          ") || ERRORS=0
+            echo "ERROR-level findings: $ERRORS"
+            if [ "$ERRORS" -gt 0 ]; then
+              echo "::warning::Found $ERRORS ERROR-level findings - review recommended"
+            fi
+          else
+            echo "No semgrep.sarif file found, skipping ERROR check"
+          fi
+
+      - name: Upload SARIF
+        if: always() && inputs.enable_semgrep
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          retention-days: 7
+
+  trivy:
+    name: Trivy
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Trivy disabled
+        if: ${{ !inputs.enable_trivy }}
+        run: |
+          echo '::notice title=Tool Disabled::Trivy is disabled. Set enable_trivy: true to re-enable.'
+
+      - name: Run Trivy
+        id: run_trivy
+        if: inputs.enable_trivy
+        continue-on-error: true  # Scanner failures don't fail the job — a crash produces no SARIF,
+                                  # which the Validate step catches explicitly below.
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret,misconfig'
+          vuln-type: 'library'  # Scans dependency vulnerabilities only — not OS packages.
+                                # Tradeoff: OS-level CVEs in the runner image are ignored.
+          format: 'sarif'
+          output: 'trivy.sarif'
+
+      - name: Check Trivy result
+        if: steps.run_trivy.outcome == 'failure'
+        run: echo "::warning title=Trivy::Trivy exited non-zero — results may be incomplete"
+
+      - name: Validate Trivy SARIF
+        if: always() && inputs.enable_trivy
+        run: |
+          set -euo pipefail
+          [ -s trivy.sarif ] || { echo "::error::trivy.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('trivy.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::trivy produced {n} finding(s)' if n else '::notice::trivy completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && inputs.enable_trivy
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trivy-sarif
+          path: trivy.sarif
+          retention-days: 7
+
+  trufflehog:
+    name: TruffleHog
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: TruffleHog disabled
+        if: ${{ !inputs.enable_trufflehog }}
+        run: |
+          echo '::notice title=Tool Disabled::TruffleHog is disabled. Set enable_trufflehog: true to re-enable.'
+
+      - name: Run TruffleHog
+        id: run_trufflehog
+        if: inputs.enable_trufflehog
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          IMAGE="trufflesecurity/trufflehog:3.93.4@sha256:9a67b6d931488173eb093826eb0eec1141188e1511309801168387e65a485762"
+          PULL_OK=false
+
+          # Docker Hub rate-limits unauthenticated pulls. Three retries with a
+          # 10s backoff handle transient failures without blocking the workflow.
+          for i in 1 2 3; do
+            if docker pull "$IMAGE"; then
+              PULL_OK=true
+              break
+            fi
+            if [ "$i" -lt 3 ]; then
+              echo "Attempt $i/3 failed, retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+          if [ "$PULL_OK" != "true" ]; then
+            echo "::error::Failed to pull $IMAGE after 3 attempts"
+            exit 1
+          fi
+
+          # Use read-only mount and disable network after pull to limit container privileges.
+          # Scan git history (not just filesystem) to catch committed-then-deleted secrets.
+          # Gitleaks complements this with filesystem-only regex/entropy heuristics.
+          docker run --rm --network=none -v "$PWD:/pwd:ro" "$IMAGE" \
+            git file:///pwd \
+            --json | python3 -c "
+          import sys, json
+          skipped = 0
+          for line in sys.stdin:
+              try:
+                  obj = json.loads(line)
+                  obj.pop('Raw', None)
+                  obj.pop('RawV2', None)
+                  print(json.dumps(obj))
+              except Exception:
+                  skipped += 1
+          if skipped:
+              print(f'::warning::TruffleHog: {skipped} malformed output line(s) skipped', file=sys.stderr)
+          " > trufflehog.json
+
+      - name: Check TruffleHog result
+        if: steps.run_trufflehog.outcome == 'failure'
+        run: echo "::warning title=TruffleHog::TruffleHog exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        if: inputs.enable_trufflehog
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: steps.run_trufflehog.outcome != 'failure' && inputs.enable_trufflehog
+        run: |
+          python3 << 'EOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TruffleHog",
+                          "version": "3.93.4"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          skipped = 0
+          try:
+              with open('trufflehog.json', 'r') as f:
+                  for line in f:
+                      try:
+                          finding = json.loads(line.strip())
+
+                          detector = finding.get('DetectorName', 'secret-detected')
+                          source_metadata = (finding.get('SourceMetadata') or {}).get('Data') or {}
+                          # Support both git mode (Git key) and filesystem mode (Filesystem key)
+                          git_data = source_metadata.get('Git') or {}
+                          filesystem_data = source_metadata.get('Filesystem') or {}
+                          filepath = git_data.get('file') or filesystem_data.get('file', 'unknown')
+                          commit = git_data.get('commit', '')
+
+                          message = f"Secret detected: {detector}"
+                          if commit:
+                              message += f" (commit: {commit[:12]})"
+
+                          result = {
+                              "ruleId": detector,
+                              "level": "error",
+                              "message": {"text": message},
+                              "locations": [{
+                                  "physicalLocation": {
+                                      "artifactLocation": {"uri": filepath},
+                                      "region": {"startLine": git_data.get('line', 1)}
+                                  }
+                              }]
+                          }
+                          sarif["runs"][0]["results"].append(result)
+                      except Exception as e:
+                          skipped += 1
+                          print(f"Warning: skipping malformed TruffleHog finding: {e}")
+                          continue
+          except Exception as e:
+              raise SystemExit(f"Error reading trufflehog.json: {e}")
+
+          if skipped > 0:
+              print(f"::warning::TruffleHog SARIF conversion: {skipped} finding(s) dropped due to parse errors")
+
+          with open('trufflehog.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Cleanup raw TruffleHog results
+        if: always() && steps.run_trufflehog.outcome == 'success' && inputs.enable_trufflehog
+        run: rm -f trufflehog.json
+
+      - name: Validate TruffleHog SARIF
+        if: always() && inputs.enable_trufflehog
+        run: |
+          set -euo pipefail
+          [ -s trufflehog.sarif ] || { echo "::error::trufflehog.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('trufflehog.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::trufflehog produced {n} finding(s)' if n else '::notice::trufflehog completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && inputs.enable_trufflehog
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trufflehog-sarif
+          path: trufflehog.sarif
+          retention-days: 7
+
+  # NOTE: dependency-review has pull-requests: write AND checks out code, which is
+  # an exception to the general principle of isolating write tokens from code execution.
+  # This is accepted because dependency-review-action is maintained by GitHub (actions org)
+  # and the write permission is required for its comment-summary-in-pr feature.
+  # The restricted-token fallback (fork/bot path below) drops the comment feature.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    if: inputs.pr_base_sha != ''
+    # dependency-review requires a base/head comparison and only works on PRs.
+    # pr_base_sha is passed by the orchestrator on PR runs and empty on push/schedule/dispatch.
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review disabled
+        if: ${{ !inputs.enable_dependency_review }}
+        run: |
+          echo '::notice title=Tool Disabled::Dependency Review is disabled. Set enable_dependency_review: true to re-enable.'
+
+      - name: Dependency Review
+        if: inputs.enable_dependency_review && !github.event.pull_request.head.repo.fork && github.event.pull_request.user.type != 'Bot'
+        uses: actions/dependency-review-action@05fe4576374b728f0c523d6a13d64c25081e0803 # v4
+        with:
+          fail-on-severity: critical  # Only hard-fails on critical vulnerabilities. High/medium
+                                      # findings are reported but won't block the PR.
+          comment-summary-in-pr: 'on-failure'
+
+      - name: Dependency Review (restricted token mode)
+        if: inputs.enable_dependency_review && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.type == 'Bot')
+        uses: actions/dependency-review-action@05fe4576374b728f0c523d6a13d64c25081e0803 # v4
+        with:
+          fail-on-severity: critical
+
+  license-scan:
+    name: License Compliance
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: License scan disabled
+        if: ${{ !inputs.enable_license_scan }}
+        run: |
+          echo '::notice title=Tool Disabled::License scan is disabled. Set enable_license_scan: true to re-enable.'
+
+      - name: Run Trivy license scan
+        id: trivy_license
+        if: inputs.enable_license_scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'license'
+          format: 'json'
+          output: 'trivy-license.json'
+
+      - name: Check Trivy license scan result
+        if: steps.trivy_license.outcome == 'failure'
+        run: echo "::warning title=Trivy license scan::Trivy license scan exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        if: inputs.enable_license_scan
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && inputs.enable_license_scan && steps.trivy_license.outcome != 'failure'
+        run: |
+          python3 << 'EOF'
+          import json
+
+          # Licenses considered restrictive for proprietary/commercial use
+          # Restricted → error (blocks): strong copyleft, incompatible with most commercial use.
+          # Copyleft → warning (review): weak copyleft, may require source disclosure on linking.
+          # All other licenses are silently skipped — only these two sets are flagged.
+          RESTRICTED_LICENSES = {
+              'AGPL-1.0', 'AGPL-1.0-only', 'AGPL-1.0-or-later',
+              'AGPL-3.0', 'AGPL-3.0-only', 'AGPL-3.0-or-later',
+              'GPL-2.0', 'GPL-2.0-only', 'GPL-2.0-or-later',
+              'GPL-3.0', 'GPL-3.0-only', 'GPL-3.0-or-later',
+              'SSPL-1.0', 'EUPL-1.1', 'EUPL-1.2',
+              'OSL-3.0', 'CPAL-1.0', 'CPL-1.0',
+          }
+
+          COPYLEFT_LICENSES = {
+              'LGPL-2.0', 'LGPL-2.0-only', 'LGPL-2.0-or-later',
+              'LGPL-2.1', 'LGPL-2.1-only', 'LGPL-2.1-or-later',
+              'LGPL-3.0', 'LGPL-3.0-only', 'LGPL-3.0-or-later',
+              'MPL-2.0', 'EPL-1.0', 'EPL-2.0',
+          }
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "license-scan",
+                          "version": "0.34.0",
+                          "informationUri": "https://aquasecurity.github.io/trivy/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('trivy-license.json', 'r') as f:
+                  data = json.load(f)
+
+              results_list = data if isinstance(data, list) else data.get('Results', [])
+
+              for target in results_list:
+                  target_name = target.get('Target', 'unknown')
+                  licenses = target.get('Licenses', [])
+
+                  for lic in (licenses or []):
+                      pkg_name = lic.get('PkgName', 'unknown')
+                      license_name = lic.get('Name', 'unknown')
+                      category = lic.get('Category', '')
+                      filepath = lic.get('FilePath', target_name)
+
+                      if license_name in RESTRICTED_LICENSES:
+                          level = 'error'
+                          message = f"Restricted license: {pkg_name} uses {license_name} (strong copyleft). Review required for commercial use."
+                      elif license_name in COPYLEFT_LICENSES:
+                          level = 'warning'
+                          message = f"Copyleft license: {pkg_name} uses {license_name} (weak copyleft). Verify linking compliance."
+                      elif category in ('restricted', 'forbidden'):
+                          level = 'error'
+                          message = f"Restricted license: {pkg_name} uses {license_name}. Review required."
+                      elif category in ('reciprocal',):
+                          level = 'warning'
+                          message = f"Reciprocal license: {pkg_name} uses {license_name}. Verify compliance."
+                      else:
+                          continue
+
+                      result = {
+                          "ruleId": f"license-{license_name}",
+                          "level": level,
+                          "message": {"text": message},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": 1}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              raise SystemExit(f"Error processing license scan results: {e}")
+
+          with open('license-scan.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate License SARIF
+        if: always() && inputs.enable_license_scan
+        run: |
+          set -euo pipefail
+          [ -s license-scan.sarif ] || { echo "::error::license-scan.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('license-scan.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::license-scan produced {n} finding(s)' if n else '::notice::license-scan completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && inputs.enable_license_scan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: license-scan-sarif
+          path: license-scan.sarif
+          retention-days: 7
+
+  grype:
+    name: Grype (SCA)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # fetch-depth: 1 (default) — Grype scans the filesystem only; git history not needed.
+
+      - name: Grype disabled
+        if: ${{ !inputs.enable_grype }}
+        run: |
+          echo '::notice title=Tool Disabled::Grype is disabled. Set enable_grype: true to re-enable.'
+
+      - name: Run Grype
+        id: run_grype
+        if: inputs.enable_grype
+        continue-on-error: true
+        uses: anchore/scan-action@7037fa011853d5a11690026fb85feee79f4c946c # v7.3.2
+        with:
+          path: "."
+          fail-build: false
+          output-format: sarif
+          output-file: grype.sarif
+
+      - name: Check Grype result
+        if: steps.run_grype.outcome == 'failure'
+        run: echo "::warning title=Grype::Grype exited non-zero — results may be incomplete"
+
+      - name: Validate Grype SARIF
+        if: always() && inputs.enable_grype
+        run: |
+          set -euo pipefail
+          [ -s grype.sarif ] || { echo "::error::grype.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('grype.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::grype produced {n} finding(s)' if n else '::notice::grype completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && inputs.enable_grype
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: grype-sarif
+          path: grype.sarif
+          retention-days: 7
+
+  gitleaks:
+    name: Gitleaks (Secret Detection)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # fetch-depth: 1 (default) — Gitleaks uses 'directory' mode (filesystem only).
+          # TruffleHog handles git-history scanning; Gitleaks complements it with
+          # different regex/entropy heuristics on the current file tree.
+
+      - name: Gitleaks disabled
+        if: ${{ !inputs.enable_gitleaks }}
+        run: |
+          echo '::notice title=Tool Disabled::Gitleaks is disabled. Set enable_gitleaks: true to re-enable.'
+
+      - name: Set up Go for Gitleaks
+        if: inputs.enable_gitleaks
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24.1'
+          cache: false
+
+      - name: Install Gitleaks
+        if: inputs.enable_gitleaks
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          # Supply-chain integrity for go-installed tools is verified by the Go checksum
+          # database (sum.golang.org). pip, composer, dotnet, and PSGallery installs are
+          # similarly verified by their respective registries. SHA256 verification is only
+          # added for direct binary downloads (hadolint, kubescape, PMD, poutine).
+          # go install integrity: version tag is verified against sum.golang.org (Go checksum DB).
+          # Tag mutations are publicly logged and detectable. See actionlint install block above.
+          GITLEAKS_VERSION="8.30.0"
+          for i in 1 2 3; do
+            GOBIN="$RUNNER_TEMP/bin" go install github.com/gitleaks/gitleaks/v8@v${GITLEAKS_VERSION} && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install gitleaks after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run Gitleaks
+        id: run_gitleaks
+        if: inputs.enable_gitleaks
+        continue-on-error: true
+        # 'gitleaks directory' scans the working directory as files rather than git history.
+        # TruffleHog already handles git-history scanning; Gitleaks complements
+        # it with different regex/entropy heuristics on the current file tree.
+        # Note: 'gitleaks detect' was deprecated in v8.30.0; 'directory' is the replacement.
+        run: gitleaks directory . --report-format sarif --report-path gitleaks.sarif
+
+      - name: Check Gitleaks result
+        if: steps.run_gitleaks.outcome == 'failure'
+        run: echo "::warning title=Gitleaks::Gitleaks exited non-zero — results may be incomplete"
+
+      - name: Validate Gitleaks SARIF
+        if: always() && inputs.enable_gitleaks
+        run: |
+          set -euo pipefail
+          [ -s gitleaks.sarif ] || { echo "::error::gitleaks.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('gitleaks.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::gitleaks produced {n} finding(s)' if n else '::notice::gitleaks completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && inputs.enable_gitleaks
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          retention-days: 7
+
+  syft:
+    name: Syft (SBOM Generation)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read           # Restricts this job from using workflow-level pull-requests: write.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Syft disabled
+        if: ${{ !inputs.enable_syft }}
+        run: |
+          echo '::notice title=Tool Disabled::Syft is disabled. Set enable_syft: true to re-enable.'
+
+      - name: Set up Go for Syft
+        if: inputs.enable_syft
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24.1'
+          cache: false
+
+      - name: Install Syft
+        if: inputs.enable_syft
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          # go install integrity: version tag is verified against sum.golang.org (Go checksum DB).
+          # Tag mutations are publicly logged and detectable. See actionlint install block above.
+          SYFT_VERSION="1.42.1"
+          for i in 1 2 3; do
+            GOBIN="$RUNNER_TEMP/bin" go install github.com/anchore/syft/cmd/syft@v${SYFT_VERSION} && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install syft after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Generate SBOM
+        id: run_syft
+        if: inputs.enable_syft
+        continue-on-error: true
+        run: |
+          syft scan dir:. \
+            --output cyclonedx-json=sbom.cdx.json \
+            --output spdx-json=sbom.spdx.json
+
+      - name: Check Syft result
+        if: steps.run_syft.outcome == 'failure'
+        run: echo "::warning title=Syft::Syft exited non-zero — SBOM may be incomplete"
+
+      - name: Validate SBOM
+        if: steps.run_syft.outcome == 'success' && inputs.enable_syft
+        run: |
+          set -euo pipefail
+          [ -s sbom.cdx.json ] || { echo "::error::sbom.cdx.json was not generated. Syft did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('sbom.cdx.json')); assert data.get('bomFormat') == 'CycloneDX'"
+
+      - name: Upload SBOM artifacts
+        if: always() && inputs.enable_syft
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: syft-sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          retention-days: 7

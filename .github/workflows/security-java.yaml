@@ -1,0 +1,143 @@
+name: Java/Kotlin Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_pmd:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  pmd:
+    name: PMD (Java/Kotlin Security)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed Java/Kotlin files
+        id: check_java
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_java_files.txt
+          label: Java/Kotlin
+          include-regex: '\.(java|kt|kts)$'
+          exclude-regex: '(^|/)node_modules/|(^|/)vendor/'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      - name: PMD disabled
+        if: steps.check_java.outputs.has_files == 'true' && !inputs.enable_pmd
+        run: |
+          echo '::notice title=Tool Disabled::PMD is disabled. Set enable_pmd: true to re-enable.'
+
+      - name: Set up Java
+        if: steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache PMD
+        if: steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/pmd
+          key: ${{ runner.os }}-pmd-7.12.0
+
+      - name: Install PMD
+        if: steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        run: |
+          # Skip download if PMD is already cached — cache action restores ~/pmd across runs.
+          if [ ! -f ~/pmd/bin/pmd ]; then
+            PMD_SHA256="d679c04f4e6e14e82660bfdc25127e4a3efe68be1e0d53ab6e80fbb0b6e1a8c0"  # Supply-chain guard: verifies the binary before executing it. Obtained via: sha256sum pmd-dist-7.12.0-bin.zip
+            for i in 1 2 3; do
+              curl -fsSL "https://github.com/pmd/pmd/releases/download/pmd_releases%2F7.12.0/pmd-dist-7.12.0-bin.zip" -o pmd.zip && break
+              [ "$i" -lt 3 ] || { echo "::error::Failed to download PMD after 3 attempts"; exit 1; }
+              echo "Attempt $i/3 failed, retrying in 10s..."
+              sleep 10
+            done
+            echo "$PMD_SHA256  pmd.zip" | sha256sum -c - || { echo "Checksum verification failed!"; exit 1; }
+            unzip -q pmd.zip -d ~/
+            mv ~/pmd-bin-7.12.0 ~/pmd
+          fi
+
+      - name: Verify PMD binary integrity
+        if: steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        run: |
+          if [ ! -f ~/pmd/bin/pmd ]; then
+            echo "::error::PMD binary not found after cache restore + install"
+            exit 1
+          fi
+          PMD_VER=$(~/pmd/bin/pmd --version 2>/dev/null || echo "unknown")
+          if ! echo "$PMD_VER" | grep -q "7.12.0"; then
+            echo "::error::PMD version mismatch: expected 7.12.0, got $PMD_VER"
+            exit 1
+          fi
+
+      - name: Run PMD
+        id: run_pmd
+        if: steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        continue-on-error: true
+        run: |
+          # Convert NUL-delimited file list to newline-delimited for PMD's --file-list.
+          tr '\0' '\n' < changed_java_files.txt > pmd_file_list.txt
+          file_count=$(wc -l < pmd_file_list.txt | tr -d ' ')
+
+          if [ "$file_count" -eq 0 ]; then
+            echo "::warning::No Java/Kotlin files in manifest"
+            exit 1
+          fi
+
+          echo "Running PMD on $file_count file(s) in a single batch..."
+
+          # Single PMD invocation for all files — avoids spawning one JVM per file.
+          ~/pmd/bin/pmd check \
+            --file-list pmd_file_list.txt \
+            -R category/java/security.xml,category/java/errorprone.xml \
+            -f sarif \
+            --no-progress \
+            > pmd.sarif 2>/dev/null || true
+
+          if [ ! -s pmd.sarif ]; then
+            echo "::error::PMD produced no output for $file_count file(s)"
+            exit 1
+          fi
+
+          echo "PMD batch complete — processed $file_count file(s)"
+
+      - name: Check PMD result
+        if: steps.run_pmd.outcome == 'failure'
+        run: echo "::warning title=PMD::PMD exited non-zero — results may be incomplete"
+
+      - name: Validate PMD SARIF
+        if: always() && steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        run: |
+          set -euo pipefail
+          [ -s pmd.sarif ] || { echo "::error::pmd.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('pmd.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::pmd produced {n} finding(s)' if n else '::notice::pmd completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_java.outputs.has_files == 'true' && inputs.enable_pmd
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pmd-sarif
+          path: pmd.sarif
+          retention-days: 7

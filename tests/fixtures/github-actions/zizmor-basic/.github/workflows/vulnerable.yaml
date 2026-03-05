@@ -1,0 +1,9 @@
+name: Vulnerable
+on:
+  issues:
+    types: [opened]
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Issue title: ${{ github.event.issue.title }}"

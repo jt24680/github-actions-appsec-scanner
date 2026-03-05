@@ -1,0 +1,1226 @@
+name: IaC Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_checkov:
+        type: boolean
+        default: true
+      enable_ansible_lint:
+        type: boolean
+        default: true
+      enable_terraform_validate:
+        type: boolean
+        default: true
+      enable_terraform_fmt:
+        type: boolean
+        default: true
+      enable_tflint:
+        type: boolean
+        default: true
+      enable_kube_linter:
+        type: boolean
+        default: true
+      enable_hadolint:
+        type: boolean
+        default: true
+      enable_kubescape:
+        type: boolean
+        default: true
+      enable_pluto:
+        type: boolean
+        default: true
+      has_terraform:
+        type: boolean
+        default: true   # default true preserves behavior when called without orchestrator
+      has_dockerfile:
+        type: boolean
+        default: true
+      has_kubernetes:
+        type: boolean
+        default: true
+      has_ansible:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  checkov:
+    name: Checkov IaC
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for changed IaC files
+        id: check_iac
+        env:
+          HAS_TERRAFORM: ${{ inputs.has_terraform }}
+          HAS_DOCKERFILE: ${{ inputs.has_dockerfile }}
+          HAS_KUBERNETES: ${{ inputs.has_kubernetes }}
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "No PR context — scanning all IaC files"
+          fi
+          # Routing decided by the orchestrator detect job.
+          if [ "$HAS_TERRAFORM" = "true" ] || [ "$HAS_DOCKERFILE" = "true" ] || [ "$HAS_KUBERNETES" = "true" ]; then
+            echo "has_iac=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
+              echo "No IaC files changed in this PR"
+            fi
+            echo "has_iac=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkov disabled
+        if: steps.check_iac.outputs.has_iac == 'true' && !inputs.enable_checkov
+        run: |
+          echo '::notice title=Tool Disabled::Checkov is disabled. Set enable_checkov: true to re-enable.'
+
+      - name: Run Checkov
+        if: steps.check_iac.outputs.has_iac == 'true' && inputs.enable_checkov
+        uses: bridgecrewio/checkov-action@05d9f3cd4807c3dea7444d4e60dc44ad57928ab5 # pinned SHA; keep comment for auditability
+        with:
+          version: '3.2.350'
+          directory: .
+          framework: all  # Scans Terraform, Dockerfile, K8s, Helm, CloudFormation, and more in one pass.
+          output_format: sarif
+          output_file_path: ./
+          soft_fail_on: LOW,MEDIUM    # Findings reported but don't fail the job.
+          hard_fail_on: HIGH,CRITICAL # Findings fail the job and block merge.
+
+      - name: Rename Checkov output
+        if: always() && steps.check_iac.outputs.has_iac == 'true' && inputs.enable_checkov
+        run: |
+          # Checkov with output_file_path=./ writes results_sarif.sarif.
+          SARIF_FILE=$(find . -maxdepth 1 -name 'results_sarif.sarif' -o -name 'results.sarif' | head -1)
+          if [ -n "$SARIF_FILE" ]; then
+            mv "$SARIF_FILE" checkov.sarif
+          else
+            echo "::warning::No Checkov SARIF output found"
+          fi
+
+      - name: Validate Checkov SARIF
+        if: always() && steps.check_iac.outputs.has_iac == 'true' && inputs.enable_checkov
+        run: |
+          set -euo pipefail
+          [ -s checkov.sarif ] || { echo "::error::checkov.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('checkov.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::checkov produced {n} finding(s)' if n else '::notice::checkov completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_iac.outputs.has_iac == 'true' && inputs.enable_checkov
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checkov-sarif
+          path: checkov.sarif
+          retention-days: 7
+
+  ansible-lint:
+    name: ansible-lint (Ansible Security)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for changed Ansible files
+        id: check_ansible
+        env:
+          DIFF_ROUTED: ${{ inputs.has_ansible }}
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          # Skip immediately if the orchestrator detected no Ansible changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+              echo "No PR context and no Ansible project structure found — skipping"
+            else
+              echo "No Ansible files changed in this PR"
+            fi
+            echo "has_ansible=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Verify the repo actually contains Ansible project structure before running
+          # ansible-lint (it needs roles/playbook context to function correctly).
+          if find . \( -path '*/roles/*' -o -path '*/playbooks/*' -o -name 'site.yml' \
+              -o -name 'site.yaml' -o -name 'galaxy.yml' \) \
+              -not -path './.git/*' | grep -q .; then
+            if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+              echo "No PR context — Ansible project detected, scanning whole repo"
+            fi
+            echo "has_ansible=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+              echo "No PR context and no Ansible project structure found — skipping"
+            fi
+            echo "has_ansible=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: ansible-lint disabled
+        if: steps.check_ansible.outputs.has_ansible == 'true' && !inputs.enable_ansible_lint
+        run: |
+          echo '::notice title=Tool Disabled::ansible-lint is disabled. Set enable_ansible_lint: true to re-enable.'
+
+      - name: Set up Python
+        if: steps.check_ansible.outputs.has_ansible == 'true' && inputs.enable_ansible_lint
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache ansible-lint
+        if: steps.check_ansible.outputs.has_ansible == 'true' && inputs.enable_ansible_lint
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-ansible-lint-${{ hashFiles('.github/workflows/security-iac.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-ansible-lint-
+
+      - name: Install ansible-lint
+        if: steps.check_ansible.outputs.has_ansible == 'true' && inputs.enable_ansible_lint
+        run: |
+          for i in 1 2 3; do
+            pip install ansible-lint==25.1.3 && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install ansible-lint after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run ansible-lint
+        id: run_ansible_lint
+        # ansible-lint scans the entire repo — not just changed files — because it needs
+        # full role/playbook context to correctly resolve dependencies and variable usage.
+        # --format sarif requires ansible-lint >= 6.22.
+        if: steps.check_ansible.outputs.has_ansible == 'true' && inputs.enable_ansible_lint
+        continue-on-error: true
+        run: ansible-lint --format sarif -o ansible-lint.sarif .
+
+      - name: Check ansible-lint result
+        if: steps.run_ansible_lint.outcome == 'failure'
+        run: echo "::warning title=ansible-lint::ansible-lint exited non-zero — results may be incomplete"
+
+      - name: Validate ansible-lint SARIF
+        if: always() && steps.check_ansible.outputs.has_ansible == 'true' && inputs.enable_ansible_lint
+        run: |
+          set -euo pipefail
+          [ -s ansible-lint.sarif ] || { echo "::error::ansible-lint.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('ansible-lint.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::ansible-lint produced {n} finding(s)' if n else '::notice::ansible-lint completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_ansible.outputs.has_ansible == 'true' && inputs.enable_ansible_lint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ansible-lint-sarif
+          path: ansible-lint.sarif
+          retention-days: 7
+
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for Terraform files
+        id: check_tf
+        env:
+          DIFF_ROUTED: ${{ inputs.has_terraform }}
+        run: |
+          # Skip immediately if the orchestrator detected no Terraform changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if find . -name '*.tf' -not -path './.git/*' | grep -q .; then
+            echo "has_tf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Terraform Validate disabled
+        if: steps.check_tf.outputs.has_tf == 'true' && !inputs.enable_terraform_validate
+        run: |
+          echo '::notice title=Tool Disabled::Terraform Validate is disabled. Set enable_terraform_validate: true to re-enable.'
+
+      - name: Set up Terraform
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_validate
+        uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Run terraform validate
+        id: run_tf_validate
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_validate
+        continue-on-error: true
+        run: |
+          # Find directories containing .tf files (root modules)
+          find . -name '*.tf' -not -path './.git/*' -exec dirname {} \; \
+            | sort -u > tf-dirs.txt
+
+          mkdir -p tf-validate-results
+          successful_modules=0
+          failed_modules=0
+          while read -r dir; do
+            [ -n "$dir" ] || continue
+            echo "Validating $dir..."
+            RESULT_FILE="tf-validate-results/$(echo "$dir" | tr '/' '_').json"
+            INIT_ERR="tf-validate-results/$(echo "$dir" | tr '/' '_').init.err"
+            VALIDATE_ERR="tf-validate-results/$(echo "$dir" | tr '/' '_').validate.err"
+            (
+              cd "$dir"
+              if ! terraform init -backend=false -input=false >/dev/null 2>"$GITHUB_WORKSPACE/$INIT_ERR"; then
+                echo "::warning::terraform init failed in $dir; attempting validate anyway to collect diagnostics"
+              fi
+              terraform validate -json > "$GITHUB_WORKSPACE/$RESULT_FILE" 2>"$GITHUB_WORKSPACE/$VALIDATE_ERR" || true
+            )
+
+            # Accept non-zero terraform validate exit codes when JSON output exists
+            # and is parseable; findings and invalid configs still produce JSON.
+            if [ -s "$RESULT_FILE" ] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$RESULT_FILE" >/dev/null 2>&1; then
+              TF_RESULT_FILE="$RESULT_FILE" TF_DIR="$dir" python3 -c "
+          import json, os
+          result_file = os.environ['TF_RESULT_FILE']
+          with open(result_file) as f:
+              data = json.load(f)
+          data['_dir'] = os.environ['TF_DIR']
+          with open(result_file, 'w') as f:
+              json.dump(data, f)
+          " >/dev/null 2>&1 || {
+                failed_modules=$((failed_modules + 1))
+                rm -f "$RESULT_FILE"
+                echo "::warning::Failed to post-process terraform validate output for $dir"
+                continue
+              }
+              successful_modules=$((successful_modules + 1))
+            else
+              failed_modules=$((failed_modules + 1))
+              rm -f "$RESULT_FILE"
+              echo "::warning::terraform validate produced no parseable JSON for $dir"
+            fi
+          done < tf-dirs.txt
+
+          if [ "$successful_modules" -eq 0 ]; then
+            echo "::error::terraform validate did not produce parseable JSON for any module."
+            exit 1
+          fi
+
+          if [ "$failed_modules" -gt 0 ]; then
+            echo "::warning::terraform validate failed for $failed_modules module(s); continuing with partial results from $successful_modules module(s)."
+          fi
+
+      - name: Check terraform validate result
+        if: steps.run_tf_validate.outcome == 'failure'
+        run: echo "::warning title=terraform validate::terraform validate exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_validate && steps.run_tf_validate.outcome != 'failure'
+        run: |
+          python3 << 'PYEOF'
+          import json, os, glob
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "terraform-validate",
+                          "informationUri": "https://developer.hashicorp.com/terraform/cli/commands/validate"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          for result_file in sorted(glob.glob("tf-validate-results/*.json")):
+              try:
+                  with open(result_file) as f:
+                      data = json.load(f)
+
+                  module_dir = data.get("_dir", ".")
+                  if module_dir.startswith("./"):
+                      module_dir = module_dir[2:]
+
+                  for diag in data.get("diagnostics", []):
+                      severity = diag.get("severity", "error")
+                      level = "error" if severity == "error" else "warning"
+                      summary = diag.get("summary", "Validation issue")
+                      detail = diag.get("detail", "")
+                      message = f"{summary}: {detail}" if detail else summary
+
+                      # Extract location if available
+                      diag_range = diag.get("range", {})
+                      filename = diag_range.get("filename", "")
+                      start = diag_range.get("start", {})
+                      line = start.get("line", 1)
+
+                      if filename:
+                          filepath = os.path.join(module_dir, filename) if module_dir != "." else filename
+                      else:
+                          filepath = module_dir
+
+                      result = {
+                          "ruleId": "terraform-validate",
+                          "level": level,
+                          "message": {"text": message},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": line}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+              except Exception as e:
+                  print(f"Warning: failed to parse {result_file}: {e}")
+
+          with open("terraform-validate.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+          PYEOF
+
+      - name: Validate Terraform Validate SARIF
+        if: always() && steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_validate
+        run: |
+          set -euo pipefail
+          [ "${{ steps.run_tf_validate.outcome }}" != "failure" ] || { echo "::error::terraform validate failed before producing reliable SARIF output."; exit 1; }
+          [ -s terraform-validate.sarif ] || { echo "::error::terraform-validate.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('terraform-validate.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::terraform-validate produced {n} finding(s)' if n else '::notice::terraform-validate completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_validate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terraform-validate-sarif
+          path: terraform-validate.sarif
+          retention-days: 7
+
+  terraform-fmt:
+    name: Terraform Format Check
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for Terraform files
+        id: check_tf
+        env:
+          DIFF_ROUTED: ${{ inputs.has_terraform }}
+        run: |
+          # Skip immediately if the orchestrator detected no Terraform changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if find . -name '*.tf' -not -path './.git/*' | grep -q .; then
+            echo "has_tf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Terraform Format disabled
+        if: steps.check_tf.outputs.has_tf == 'true' && !inputs.enable_terraform_fmt
+        run: |
+          echo '::notice title=Tool Disabled::Terraform Format Check is disabled. Set enable_terraform_fmt: true to re-enable.'
+
+      - name: Set up Terraform
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_fmt
+        uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Run terraform fmt
+        id: run_tf_fmt
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_fmt
+        continue-on-error: true
+        run: |
+          FMT_EXIT=0
+          terraform fmt -check -recursive > fmt-files.txt 2>fmt.stderr || FMT_EXIT=$?
+          # terraform fmt -check exits 3 when formatting issues are found.
+          if [ "$FMT_EXIT" -eq 0 ] || [ "$FMT_EXIT" -eq 3 ]; then
+            exit 0
+          fi
+          echo "::error::terraform fmt failed with exit code $FMT_EXIT"
+          if [ -s fmt.stderr ]; then
+            sed -n '1,20p' fmt.stderr
+          fi
+          exit "$FMT_EXIT"
+
+      - name: Check terraform fmt result
+        if: steps.run_tf_fmt.outcome == 'failure'
+        run: echo "::warning title=terraform fmt::terraform fmt exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_fmt && steps.run_tf_fmt.outcome != 'failure'
+        run: |
+          python3 << 'PYEOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "terraform-fmt",
+                          "informationUri": "https://developer.hashicorp.com/terraform/cli/commands/fmt"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open("fmt-files.txt") as f:
+                  content = f.read().strip()
+              if content:
+                  for filepath in content.splitlines():
+                      filepath = filepath.strip()
+                      if not filepath or not filepath.endswith(".tf"):
+                          continue
+                      result = {
+                          "ruleId": "terraform-fmt",
+                          "level": "warning",
+                          "message": {"text": f"File is not properly formatted. Run 'terraform fmt' to fix."},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": filepath},
+                                  "region": {"startLine": 1}
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+          except Exception as e:
+              print(f"Warning: error reading fmt-files.txt: {e}")
+
+          with open("terraform-fmt.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+          PYEOF
+
+      - name: Validate Terraform Format SARIF
+        if: always() && steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_fmt
+        run: |
+          set -euo pipefail
+          [ "${{ steps.run_tf_fmt.outcome }}" != "failure" ] || { echo "::error::terraform fmt failed before producing reliable SARIF output."; exit 1; }
+          [ -s terraform-fmt.sarif ] || { echo "::error::terraform-fmt.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('terraform-fmt.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::terraform-fmt produced {n} finding(s)' if n else '::notice::terraform-fmt completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_tf.outputs.has_tf == 'true' && inputs.enable_terraform_fmt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terraform-fmt-sarif
+          path: terraform-fmt.sarif
+          retention-days: 7
+
+  tflint:
+    name: TFLint
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for Terraform files
+        id: check_tf
+        env:
+          DIFF_ROUTED: ${{ inputs.has_terraform }}
+        run: |
+          # Skip immediately if the orchestrator detected no Terraform changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if find . -name '*.tf' -not -path './.git/*' | grep -q .; then
+            echo "has_tf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: TFLint disabled
+        if: steps.check_tf.outputs.has_tf == 'true' && !inputs.enable_tflint
+        run: |
+          echo '::notice title=Tool Disabled::TFLint is disabled. Set enable_tflint: true to re-enable.'
+
+      - name: Set up TFLint
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_tflint
+        uses: terraform-linters/setup-tflint@4cb9feea73331a35b422df102992a03a44a3bb33 # v6.2.1
+        with:
+          tflint_version: v0.59.1
+
+      - name: Initialize TFLint plugins
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_tflint
+        run: |
+          if ! tflint --init; then
+            echo "::warning::tflint --init failed; continuing to attempt SARIF generation."
+          fi
+
+      - name: Run TFLint
+        id: run_tflint
+        if: steps.check_tf.outputs.has_tf == 'true' && inputs.enable_tflint
+        continue-on-error: true
+        run: |
+          # Find Terraform root module directories
+          find . -name '*.tf' -not -path './.git/*' -exec dirname {} \; \
+            | sort -u > tf-dirs.txt
+
+          DIR_COUNT=$(wc -l < tf-dirs.txt | tr -d ' ')
+
+          successful_runs=0
+          failed_runs=0
+
+          if [ "$DIR_COUNT" -eq 1 ]; then
+            # Single module — run directly
+            DIR=$(cat tf-dirs.txt)
+            tflint -f sarif --chdir "$DIR" > tflint.sarif 2>tflint-single.err || true
+            if [ -s tflint.sarif ] && python3 -c "import json; json.load(open('tflint.sarif'))" >/dev/null 2>&1; then
+              successful_runs=$((successful_runs + 1))
+            else
+              failed_runs=$((failed_runs + 1))
+              rm -f tflint.sarif
+              echo "::warning::tflint produced no parseable SARIF for $DIR"
+            fi
+          else
+            # Multiple modules — run per-directory and merge SARIF runs[] arrays
+            mkdir -p tflint-partials
+            IDX=0
+            while read -r dir; do
+              [ -n "$dir" ] || continue
+              output_file="tflint-partials/$IDX.sarif"
+              tflint -f sarif --chdir "$dir" > "$output_file" 2>"tflint-partials/$IDX.err" || true
+              if [ -s "$output_file" ] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$output_file" >/dev/null 2>&1; then
+                successful_runs=$((successful_runs + 1))
+              else
+                failed_runs=$((failed_runs + 1))
+                rm -f "$output_file"
+                echo "::warning::tflint produced no parseable SARIF for $dir"
+              fi
+              IDX=$((IDX + 1))
+            done < tf-dirs.txt
+
+            python3 << 'PYEOF'
+          import json, glob, os
+
+          merged = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TFLint",
+                          "informationUri": "https://github.com/terraform-linters/tflint"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          for partial in sorted(glob.glob("tflint-partials/*.sarif")):
+              try:
+                  with open(partial) as f:
+                      data = json.load(f)
+                  for run in data.get("runs", []):
+                      merged["runs"][0]["results"].extend(run.get("results", []))
+              except Exception as e:
+                  print(f"Warning: failed to parse {partial}: {e}")
+
+          with open("tflint.sarif", "w") as f:
+              json.dump(merged, f, indent=2)
+          PYEOF
+          fi
+
+          if [ "$successful_runs" -eq 0 ]; then
+            echo "::error::tflint did not produce parseable SARIF for any Terraform module."
+            exit 1
+          fi
+
+          if [ "$failed_runs" -gt 0 ]; then
+            echo "::warning::tflint failed for $failed_runs module(s); continuing with partial results from $successful_runs module(s)."
+          fi
+
+      - name: Check tflint result
+        if: steps.run_tflint.outcome == 'failure'
+        run: echo "::warning title=tflint::tflint exited non-zero — results may be incomplete"
+
+      - name: Validate TFLint SARIF
+        if: always() && steps.check_tf.outputs.has_tf == 'true' && inputs.enable_tflint
+        run: |
+          set -euo pipefail
+          [ "${{ steps.run_tflint.outcome }}" != "failure" ] || { echo "::error::tflint failed before producing reliable SARIF output."; exit 1; }
+          [ -s tflint.sarif ] || { echo "::error::tflint.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('tflint.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::tflint produced {n} finding(s)' if n else '::notice::tflint completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_tf.outputs.has_tf == 'true' && inputs.enable_tflint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tflint-sarif
+          path: tflint.sarif
+          retention-days: 7
+
+  kube-linter:
+    name: KubeLinter (Kubernetes)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for Kubernetes manifests
+        id: check_k8s
+        env:
+          DIFF_ROUTED: ${{ inputs.has_kubernetes }}
+        run: |
+          # Skip immediately if the orchestrator detected no Kubernetes changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            echo "has_k8s=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Check common K8s directories for YAML files
+          if find . \( -path '*/k8s/*' -o -path '*/kubernetes/*' \
+               -o -path '*/manifests/*' -o -path '*/deploy/*' \
+               -o -path '*/helm/*' \) \
+               \( -name '*.yaml' -o -name '*.yml' \) \
+               -not -path './.git/*' 2>/dev/null \
+             | grep -q .; then
+            echo "has_k8s=true" >> "$GITHUB_OUTPUT"
+          # Content-based fallback: find YAML files containing K8s markers (apiVersion + kind)
+          elif find . \( -name '*.yaml' -o -name '*.yml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               -not -path './.github/*' -print0 2>/dev/null \
+             | xargs -0 grep -lZ 'apiVersion:' 2>/dev/null \
+             | xargs -0 grep -l 'kind:' 2>/dev/null \
+             | grep -q .; then
+            echo "has_k8s=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_k8s=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: KubeLinter disabled
+        if: steps.check_k8s.outputs.has_k8s == 'true' && !inputs.enable_kube_linter
+        run: |
+          echo '::notice title=Tool Disabled::KubeLinter is disabled. Set enable_kube_linter: true to re-enable.'
+
+      - name: Run KubeLinter
+        id: run_kube_linter
+        if: steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_kube_linter
+        continue-on-error: true
+        uses: stackrox/kube-linter-action@87802a2f4e01abebb3ee3c67a3002fea71f6eae5 # v1.0.7
+        with:
+          directory: .
+          format: sarif
+          output-file: kube-linter.sarif
+
+      - name: Check KubeLinter result
+        if: steps.run_kube_linter.outcome == 'failure'
+        run: echo "::warning title=KubeLinter::KubeLinter exited non-zero — results may be incomplete"
+
+      - name: Validate KubeLinter SARIF
+        if: always() && steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_kube_linter
+        run: |
+          set -euo pipefail
+          [ -s kube-linter.sarif ] || { echo "::error::kube-linter.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('kube-linter.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::kube-linter produced {n} finding(s)' if n else '::notice::kube-linter completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_kube_linter
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kube-linter-sarif
+          path: kube-linter.sarif
+          retention-days: 7
+
+  hadolint:
+    name: Hadolint (Dockerfile)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for Dockerfiles
+        id: check_docker
+        env:
+          DIFF_ROUTED: ${{ inputs.has_dockerfile }}
+        run: |
+          # Skip immediately if the orchestrator detected no Dockerfile changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if find . \( -name 'Dockerfile' -o -name 'Dockerfile.*' \
+               -o -name '*.dockerfile' \
+               -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
+               -not -path './.git/*' | grep -q .; then
+            echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Hadolint disabled
+        if: steps.check_docker.outputs.has_dockerfile == 'true' && !inputs.enable_hadolint
+        run: |
+          echo '::notice title=Tool Disabled::Hadolint is disabled. Set enable_hadolint: true to re-enable.'
+
+      - name: Install hadolint
+        if: steps.check_docker.outputs.has_dockerfile == 'true' && inputs.enable_hadolint
+        run: |
+          HADOLINT_VERSION="2.14.0"
+          case "$(uname -m)" in
+            x86_64)  HADOLINT_ARCH="x86_64"; HADOLINT_SHA256="6bf226944684f56c84dd014e8b979d27425c0148f61b3bd99bcc6f39e9dc5a47" ;;  # Supply-chain guard
+            aarch64) HADOLINT_ARCH="arm64";  HADOLINT_SHA256="331f1d3511b84a4f1e3d18d52fec284723e4019552f4f47b19322a53ce9a40ed" ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+          for i in 1 2 3; do
+            curl -sL "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-Linux-${HADOLINT_ARCH}" \
+              -o hadolint && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to download hadolint after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "$HADOLINT_SHA256  hadolint" | sha256sum -c - || { echo "::error::Hadolint checksum verification failed!"; exit 1; }
+          # Install to RUNNER_TEMP/bin — avoids sudo and keeps install scoped to this job.
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv hadolint "$RUNNER_TEMP/bin/hadolint"
+          chmod +x "$RUNNER_TEMP/bin/hadolint"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Run hadolint
+        id: run_hadolint
+        if: steps.check_docker.outputs.has_dockerfile == 'true' && inputs.enable_hadolint
+        continue-on-error: true
+        run: |
+          find . \( -name 'Dockerfile' -o -name 'Dockerfile.*' \
+               -o -name '*.dockerfile' \
+               -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
+               -not -path './.git/*' > dockerfiles.txt
+
+          # Run hadolint per-file and merge SARIF to avoid concatenation issues
+          mkdir -p hadolint-partials
+          IDX=0
+          successful_runs=0
+          failed_runs=0
+          while IFS= read -r dockerfile; do
+            output_file="hadolint-partials/$IDX.sarif"
+            hadolint --format sarif "$dockerfile" > "$output_file" 2>"hadolint-partials/$IDX.err" || true
+            if [ -s "$output_file" ] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$output_file" >/dev/null 2>&1; then
+              successful_runs=$((successful_runs + 1))
+            else
+              failed_runs=$((failed_runs + 1))
+              rm -f "$output_file"
+              echo "::warning::hadolint produced no parseable SARIF for $dockerfile"
+            fi
+            IDX=$((IDX + 1))
+          done < dockerfiles.txt
+
+          python3 << 'PYEOF'
+          import json, glob
+
+          merged = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Hadolint",
+                          "informationUri": "https://github.com/hadolint/hadolint"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          for partial in sorted(glob.glob("hadolint-partials/*.sarif")):
+              try:
+                  with open(partial) as f:
+                      data = json.load(f)
+                  for run in data.get("runs", []):
+                      merged["runs"][0]["results"].extend(run.get("results", []))
+              except Exception as e:
+                  print(f"Warning: failed to parse {partial}: {e}")
+
+          with open("hadolint.sarif", "w") as f:
+              json.dump(merged, f, indent=2)
+          PYEOF
+
+          if [ "$successful_runs" -eq 0 ]; then
+            echo "::error::hadolint did not produce parseable SARIF for any Dockerfile."
+            exit 1
+          fi
+
+          if [ "$failed_runs" -gt 0 ]; then
+            echo "::warning::hadolint failed for $failed_runs Dockerfile(s); continuing with partial results from $successful_runs Dockerfile(s)."
+          fi
+
+      - name: Check hadolint result
+        if: steps.run_hadolint.outcome == 'failure'
+        run: echo "::warning title=hadolint::hadolint exited non-zero — results may be incomplete"
+
+      - name: Validate Hadolint SARIF
+        if: always() && steps.check_docker.outputs.has_dockerfile == 'true' && inputs.enable_hadolint
+        run: |
+          set -euo pipefail
+          [ "${{ steps.run_hadolint.outcome }}" != "failure" ] || { echo "::error::hadolint failed before producing reliable SARIF output."; exit 1; }
+          [ -s hadolint.sarif ] || { echo "::error::hadolint.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('hadolint.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::hadolint produced {n} finding(s)' if n else '::notice::hadolint completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_docker.outputs.has_dockerfile == 'true' && inputs.enable_hadolint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hadolint-sarif
+          path: hadolint.sarif
+          retention-days: 7
+
+  kubescape:
+    name: Kubescape (K8s/IaC Security)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for scannable files
+        id: check_targets
+        env:
+          HAS_KUBERNETES: ${{ inputs.has_kubernetes }}
+          HAS_DOCKERFILE: ${{ inputs.has_dockerfile }}
+        run: |
+          # Skip immediately if the orchestrator detected no relevant changes in this diff.
+          if [ "$HAS_KUBERNETES" != "true" ] && [ "$HAS_DOCKERFILE" != "true" ]; then
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # K8s manifests, Helm charts, Dockerfiles
+          if find . \( -path '*/k8s/*' -o -path '*/kubernetes/*' \
+               -o -path '*/manifests/*' -o -path '*/deploy/*' \
+               -o -path '*/helm/*' -o -name 'Dockerfile' \
+               -o -name 'Dockerfile.*' -o -name '*.dockerfile' \
+               -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
+               -not -path './.git/*' 2>/dev/null \
+             | grep -q .; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          # Content-based fallback: find YAML files containing K8s markers (apiVersion + kind)
+          elif find . \( -name '*.yaml' -o -name '*.yml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               -not -path './.github/*' -print0 2>/dev/null \
+             | xargs -0 grep -lZ 'apiVersion:' 2>/dev/null \
+             | xargs -0 grep -l 'kind:' 2>/dev/null \
+             | grep -q .; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Kubescape disabled
+        if: steps.check_targets.outputs.has_targets == 'true' && !inputs.enable_kubescape
+        run: |
+          echo '::notice title=Tool Disabled::Kubescape is disabled. Set enable_kubescape: true to re-enable.'
+
+      - name: Install Kubescape
+        if: steps.check_targets.outputs.has_targets == 'true' && inputs.enable_kubescape
+        run: |
+          KUBESCAPE_VERSION="4.0.2"
+          case "$(uname -m)" in
+            x86_64)  KUBESCAPE_ARCH="amd64"; KUBESCAPE_SHA256="01aade3aa40db727a668d1c88a09c9f107d917e21a7379311a53c3e73ed21803" ;;  # Supply-chain guard
+            aarch64) KUBESCAPE_ARCH="arm64"; KUBESCAPE_SHA256="f3ec631efb414a4568dfb08600e4704dcf40666d0d82d807cc651f887b39b71c" ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+          for i in 1 2 3; do
+            curl -sL "https://github.com/kubescape/kubescape/releases/download/v${KUBESCAPE_VERSION}/kubescape_${KUBESCAPE_VERSION}_linux_${KUBESCAPE_ARCH}" \
+              -o kubescape && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to download kubescape after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "$KUBESCAPE_SHA256  kubescape" | sha256sum -c - || { echo "::error::Kubescape checksum verification failed!"; exit 1; }
+          # Install to RUNNER_TEMP/bin — avoids sudo and keeps install scoped to this job.
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv kubescape "$RUNNER_TEMP/bin/kubescape"
+          chmod +x "$RUNNER_TEMP/bin/kubescape"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Run Kubescape
+        id: run_kubescape
+        if: steps.check_targets.outputs.has_targets == 'true' && inputs.enable_kubescape
+        continue-on-error: true
+        # --compliance-threshold 0 prevents non-zero exit on findings.
+        run: kubescape scan . --format sarif --output kubescape.sarif --compliance-threshold 0 || true
+
+      - name: Check Kubescape result
+        if: steps.run_kubescape.outcome == 'failure'
+        run: echo "::warning title=Kubescape::Kubescape exited non-zero — results may be incomplete"
+
+      - name: Validate Kubescape SARIF
+        if: always() && steps.check_targets.outputs.has_targets == 'true' && inputs.enable_kubescape
+        run: |
+          set -euo pipefail
+          [ -s kubescape.sarif ] || { echo "::error::kubescape.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('kubescape.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::kubescape produced {n} finding(s)' if n else '::notice::kubescape completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_targets.outputs.has_targets == 'true' && inputs.enable_kubescape
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kubescape-sarif
+          path: kubescape.sarif
+          retention-days: 7
+
+  pluto:
+    name: Pluto (K8s API Deprecation)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check for Kubernetes manifests
+        id: check_k8s
+        env:
+          DIFF_ROUTED: ${{ inputs.has_kubernetes }}
+        run: |
+          # Skip immediately if the orchestrator detected no Kubernetes changes in this diff.
+          if [ "$DIFF_ROUTED" != "true" ]; then
+            echo "has_k8s=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Check common K8s directories for YAML files
+          if find . \( -path '*/k8s/*' -o -path '*/kubernetes/*' \
+               -o -path '*/manifests/*' -o -path '*/deploy/*' \
+               -o -path '*/helm/*' \) \
+               \( -name '*.yaml' -o -name '*.yml' \) \
+               -not -path './.git/*' 2>/dev/null \
+             | grep -q .; then
+            echo "has_k8s=true" >> "$GITHUB_OUTPUT"
+          # Content-based fallback: find YAML files containing K8s markers (apiVersion + kind)
+          elif find . \( -name '*.yaml' -o -name '*.yml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               -not -path './.github/*' -print0 2>/dev/null \
+             | xargs -0 grep -lZ 'apiVersion:' 2>/dev/null \
+             | xargs -0 grep -l 'kind:' 2>/dev/null \
+             | grep -q .; then
+            echo "has_k8s=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_k8s=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pluto disabled
+        if: steps.check_k8s.outputs.has_k8s == 'true' && !inputs.enable_pluto
+        run: |
+          echo '::notice title=Tool Disabled::Pluto is disabled. Set enable_pluto: true to re-enable.'
+
+      - name: Install Pluto
+        if: steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_pluto
+        run: |
+          PLUTO_VERSION="5.23.0"
+          case "$(uname -m)" in
+            x86_64)  PLUTO_ARCH="amd64"; PLUTO_SHA256="9d275b359e2f0b84fe10f541b19ed7648413b9b02cafbd3d248f2a56322a1490" ;;  # Supply-chain guard
+            aarch64) PLUTO_ARCH="arm64"; PLUTO_SHA256="d7e073ed8d6bf6d39e9a1e1a77492a143ca68fe64cf6254fa3fb83dd958c8862" ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+          for i in 1 2 3; do
+            curl -sL "https://github.com/FairwindsOps/pluto/releases/download/v${PLUTO_VERSION}/pluto_${PLUTO_VERSION}_linux_${PLUTO_ARCH}.tar.gz" \
+              -o pluto.tar.gz && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to download pluto after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "$PLUTO_SHA256  pluto.tar.gz" | sha256sum -c - || { echo "::error::Pluto checksum verification failed!"; exit 1; }
+          tar xzf pluto.tar.gz pluto
+          # Install to RUNNER_TEMP/bin — avoids sudo and keeps install scoped to this job.
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv pluto "$RUNNER_TEMP/bin/pluto"
+          chmod +x "$RUNNER_TEMP/bin/pluto"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Run Pluto
+        id: run_pluto
+        if: steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_pluto
+        # Pluto exits 3 when deprecated APIs are found, 0 when clean.
+        # continue-on-error prevents the job from failing when findings exist.
+        continue-on-error: true
+        run: |
+          # Default target K8s version. Update this value when the team's minimum
+          # supported K8s version changes (e.g., after a cluster upgrade).
+          PLUTO_EXIT=0
+          pluto detect-files -d . --output json --target-versions k8s=v1.31.0 > pluto.json 2>pluto.stderr || PLUTO_EXIT=$?
+
+          # Pluto exits 3 when findings exist; only treat other codes as execution failures.
+          if [ "$PLUTO_EXIT" -ne 0 ] && [ "$PLUTO_EXIT" -ne 3 ]; then
+            echo "::error::pluto failed with exit code $PLUTO_EXIT"
+            if [ -s pluto.stderr ]; then
+              sed -n '1,20p' pluto.stderr
+            fi
+            exit "$PLUTO_EXIT"
+          fi
+
+          [ -s pluto.json ] || { echo "::error::pluto produced no JSON output."; exit 1; }
+          python3 -c "import json; json.load(open('pluto.json'))" >/dev/null 2>&1 || {
+            echo "::error::pluto produced malformed JSON output."
+            exit 1
+          }
+
+      - name: Check Pluto result
+        if: steps.run_pluto.outcome == 'failure'
+        run: echo "::warning title=Pluto::Pluto exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_pluto && steps.run_pluto.outcome != 'failure'
+        run: |
+          python3 << 'PYEOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Pluto",
+                          "version": "5.23.0",
+                          "informationUri": "https://github.com/FairwindsOps/pluto"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open("pluto.json") as f:
+                  data = json.load(f)
+          except (json.JSONDecodeError, FileNotFoundError) as e:
+              print(f"Warning: could not parse pluto.json: {e}")
+              data = {"items": []}
+
+          items = data if isinstance(data, list) else data.get("items", [])
+
+          for item in items:
+              api = item.get("api", {})
+              name = item.get("name", "unknown")
+              filepath = item.get("filePath", item.get("filepath", "unknown"))
+              api_version = api.get("version", "unknown")
+              kind = item.get("kind", api.get("kind", "unknown"))
+              deprecated_in = api.get("deprecated-in", "unknown")
+              removed_in = api.get("removed-in", "unknown")
+              replacement = api.get("replacement-api", "none")
+
+              # deprecated-but-not-removed -> warning; removed -> error
+              is_removed = removed_in != "unknown" and removed_in != ""
+              level = "error" if is_removed else "warning"
+
+              if is_removed:
+                  msg = (f"{kind} '{name}' uses deprecated API version {api_version}. "
+                         f"Deprecated in {deprecated_in}, removed in {removed_in}. "
+                         f"Replace with: {replacement}")
+              else:
+                  msg = (f"{kind} '{name}' uses deprecated API version {api_version}. "
+                         f"Deprecated in {deprecated_in}. "
+                         f"Replace with: {replacement}")
+
+              result = {
+                  "ruleId": "pluto/deprecated-api",
+                  "level": level,
+                  "message": {"text": msg},
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": filepath},
+                          "region": {"startLine": 1}
+                      }
+                  }]
+              }
+              sarif["runs"][0]["results"].append(result)
+
+          with open("pluto.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+          PYEOF
+
+      - name: Validate Pluto SARIF
+        if: always() && steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_pluto
+        run: |
+          set -euo pipefail
+          [ "${{ steps.run_pluto.outcome }}" != "failure" ] || { echo "::error::pluto failed before producing reliable SARIF output."; exit 1; }
+          [ -s pluto.sarif ] || { echo "::error::pluto.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('pluto.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::pluto produced {n} finding(s)' if n else '::notice::pluto completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_k8s.outputs.has_k8s == 'true' && inputs.enable_pluto
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pluto-sarif
+          path: pluto.sarif
+          retention-days: 7

@@ -1,0 +1,381 @@
+name: C Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_flawfinder:
+        type: boolean
+        default: true
+      enable_cppcheck:
+        type: boolean
+        default: true
+      enable_semgrep_c:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  flawfinder:
+    name: Flawfinder (C SAST)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed C files
+        id: check_c
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_c_files.txt
+          label: C/C++
+          include-regex: '\.(c|h|cpp|cc|cxx|hpp|hxx)$'
+          exclude-regex: '(^|/)node_modules/|(^|/)vendor/'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      # Log scan scope for operator visibility (matches inline-detection workflows)
+      - name: Log scan scope
+        env:
+          PR_BASE_SHA: ${{ inputs.pr_base_sha }}
+          CHECK_C_HAS_FILES: ${{ steps.check_c.outputs.has_files }}
+        run: |
+          if [ -z "$PR_BASE_SHA" ]; then
+            echo "No PR context — scanning all C/C++ files"
+          elif [ "$CHECK_C_HAS_FILES" = "false" ]; then
+            echo "No C files changed in this PR"
+          fi
+
+      - name: Flawfinder disabled
+        if: steps.check_c.outputs.has_files == 'true' && !inputs.enable_flawfinder
+        run: |
+          echo '::notice title=Tool Disabled::Flawfinder is disabled. Set enable_flawfinder: true to re-enable.'
+
+      - name: Set up Python
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_flawfinder
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Flawfinder
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_flawfinder
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-flawfinder-${{ hashFiles('.github/workflows/security-c.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-flawfinder-
+
+      - name: Install Flawfinder
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_flawfinder
+        run: |
+          for i in 1 2 3; do
+            pip install flawfinder==2.0.19 && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install Flawfinder after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run Flawfinder
+        id: run_flawfinder
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_flawfinder
+        continue-on-error: true
+        run: |
+          # mapfile -d '' reads the NUL-delimited manifest produced by collect-paths,
+          # passing each path as a discrete argument with no word-splitting risk.
+          # --minlevel 1 reports all findings (levels 1-5); raise to 2 or 3 to reduce noise.
+          # '|| true' prevents a non-zero exit code (findings exist) from failing the step.
+          mapfile -t -d '' C_FILES < changed_c_files.txt
+          flawfinder --sarif --minlevel 1 -- "${C_FILES[@]}" > flawfinder.sarif || true
+
+      - name: Check Flawfinder result
+        if: steps.run_flawfinder.outcome == 'failure'
+        run: echo "::warning title=Flawfinder::Flawfinder exited non-zero — results may be incomplete"
+
+      - name: Validate Flawfinder SARIF
+        if: always() && steps.check_c.outputs.has_files == 'true' && inputs.enable_flawfinder
+        run: |
+          set -euo pipefail
+          [ -s flawfinder.sarif ] || { echo "::error::flawfinder.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('flawfinder.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::flawfinder produced {n} finding(s)' if n else '::notice::flawfinder completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_c.outputs.has_files == 'true' && inputs.enable_flawfinder
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flawfinder-sarif
+          path: flawfinder.sarif
+          retention-days: 7
+
+  cppcheck:
+    name: Cppcheck (C Static Analysis)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed C files
+        id: check_c
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_c_files.txt
+          label: C/C++
+          include-regex: '\.(c|h|cpp|cc|cxx|hpp|hxx)$'
+          exclude-regex: '(^|/)node_modules/|(^|/)vendor/'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      - name: Cppcheck disabled
+        if: steps.check_c.outputs.has_files == 'true' && !inputs.enable_cppcheck
+        run: |
+          echo '::notice title=Tool Disabled::Cppcheck is disabled. Set enable_cppcheck: true to re-enable.'
+
+      - name: Install Cppcheck
+        # Note: this is an apt-get step, not a language-runtime setup action.
+        # Ubuntu 24.04 ships cppcheck 2.13; version check below catches unexpected regressions.
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_cppcheck
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get install -y cppcheck && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install Cppcheck after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+          # Verify installed version meets minimum baseline (2.13).
+          CPPCHECK_VER=$(cppcheck --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+          if ! echo "$CPPCHECK_VER" | grep -qE '^2\.(1[3-9]|[2-9][0-9])'; then
+            echo "::error::Cppcheck version $CPPCHECK_VER is below expected minimum 2.13"
+            exit 1
+          fi
+
+      - name: Run Cppcheck
+        id: run_cppcheck
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_cppcheck
+        continue-on-error: true
+        run: |
+          # --file-list requires newline-delimited paths; convert from NUL-delimited collect-paths output.
+          # XML output goes to stderr per cppcheck design; redirect to a file.
+          # --suppress=missingIncludeSystem silences noise from absent system headers in CI.
+          # '|| true' prevents exit code 1 (findings exist) from failing the step.
+          tr '\0' '\n' < changed_c_files.txt > changed_c_files_nl.txt
+          cppcheck \
+            --enable=warning,style,performance,portability,information \
+            --xml \
+            --xml-version=2 \
+            --suppress=missingIncludeSystem \
+            --file-list=changed_c_files_nl.txt \
+            2>cppcheck.xml || true
+
+      - name: Check Cppcheck result
+        if: steps.run_cppcheck.outcome == 'failure'
+        run: echo "::warning title=Cppcheck::Cppcheck exited non-zero — results may be incomplete"
+
+      - name: Set up Python
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_cppcheck
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Convert to SARIF
+        if: always() && steps.run_cppcheck.outcome != 'failure' && steps.check_c.outputs.has_files == 'true' && inputs.enable_cppcheck
+        run: |
+          python3 << 'EOF'
+          import json
+          import xml.etree.ElementTree as ET
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Cppcheck",
+                          "informationUri": "https://cppcheck.sourceforge.io/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          severity_map = {
+              'error':       'error',
+              'warning':     'warning',
+              'style':       'note',
+              'performance': 'note',
+              'portability': 'note',
+              'information': 'note',
+          }
+
+          try:
+              tree = ET.parse('cppcheck.xml')
+              root = tree.getroot()
+
+              # cppcheck XML v2: <results><errors><error .../></errors></results>
+              errors = root.find('errors')
+              if errors is not None:
+                  for error in errors.findall('error'):
+                      rule_id  = error.get('id', 'unknown')
+                      severity = error.get('severity', 'warning')
+                      msg      = error.get('msg', 'No description')
+                      verbose  = error.get('verbose', msg)
+                      cwe      = error.get('cwe', '')
+
+                      level = severity_map.get(severity, 'warning')
+
+                      message_text = verbose if verbose != msg else msg
+                      if cwe:
+                          message_text += f" (CWE-{cwe})"
+
+                      # Location comes from the first <location> child element
+                      location_el = error.find('location')
+                      file_path  = location_el.get('file', 'unknown') if location_el is not None else 'unknown'
+                      start_line = int(location_el.get('line', 1))    if location_el is not None else 1
+                      start_col  = int(location_el.get('column', 1))  if location_el is not None else 1
+
+                      sarif_result = {
+                          "ruleId": rule_id,
+                          "level": level,
+                          "message": {"text": message_text},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": file_path},
+                                  "region": {
+                                      "startLine":   start_line,
+                                      "startColumn": start_col
+                                  }
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(sarif_result)
+          except Exception as e:
+              raise SystemExit(f"Error processing Cppcheck results: {e}")
+
+          with open('cppcheck.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
+      - name: Validate Cppcheck SARIF
+        if: always() && steps.check_c.outputs.has_files == 'true' && inputs.enable_cppcheck
+        run: |
+          set -euo pipefail
+          [ -s cppcheck.sarif ] || { echo "::error::cppcheck.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('cppcheck.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::cppcheck produced {n} finding(s)' if n else '::notice::cppcheck completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_c.outputs.has_files == 'true' && inputs.enable_cppcheck
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cppcheck-sarif
+          path: cppcheck.sarif
+          retention-days: 7
+
+  secrets:
+    name: Secret Detection (C Files)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for changed C files
+        id: check_c
+        uses: ./.github/actions/collect-paths
+        with:
+          output: changed_c_files.txt
+          label: C/C++
+          include-regex: '\.(c|h|cpp|cc|cxx|hpp|hxx)$'
+          exclude-regex: '(^|/)node_modules/|(^|/)vendor/'
+          base-sha: ${{ inputs.pr_base_sha }}
+          head-sha: ${{ inputs.pr_head_sha }}
+
+      - name: Semgrep (C secrets) disabled
+        if: steps.check_c.outputs.has_files == 'true' && !inputs.enable_semgrep_c
+        run: |
+          echo '::notice title=Tool Disabled::Semgrep (C secrets) is disabled. Set enable_semgrep_c: true to re-enable.'
+
+      - name: Set up Python
+        # python3 is available on ubuntu-24.04 by default but we pin 3.11 here for
+        # consistency with other jobs in this workflow.
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_semgrep_c
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Semgrep
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_semgrep_c
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-semgrep-c-${{ hashFiles('.github/workflows/security-c.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-semgrep-c-
+
+      - name: Install Semgrep
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_semgrep_c
+        run: |
+          for i in 1 2 3; do
+            pip install semgrep==1.152.0 && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install Semgrep after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run Semgrep (secrets)
+        id: run_semgrep_c
+        if: steps.check_c.outputs.has_files == 'true' && inputs.enable_semgrep_c
+        continue-on-error: true
+        run: |
+          # p/secrets detects hardcoded API keys, tokens, and credentials in C source and headers.
+          # Scoped to changed C/C++ sources and headers selected by the detection step.
+          # '|| true' prevents a non-zero exit code (findings exist) from failing the step.
+          mapfile -t -d '' C_FILES < changed_c_files.txt
+          semgrep --config p/secrets --sarif --output semgrep-secrets.sarif "${C_FILES[@]}" || true
+
+      - name: Check Semgrep result
+        if: steps.run_semgrep_c.outcome == 'failure'
+        run: echo "::warning title=Semgrep::Semgrep exited non-zero — results may be incomplete"
+
+      - name: Validate Semgrep SARIF
+        if: always() && steps.check_c.outputs.has_files == 'true' && inputs.enable_semgrep_c
+        run: |
+          set -euo pipefail
+          [ -s semgrep-secrets.sarif ] || { echo "::error::semgrep-secrets.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('semgrep-secrets.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::semgrep-secrets produced {n} finding(s)' if n else '::notice::semgrep-secrets completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_c.outputs.has_files == 'true' && inputs.enable_semgrep_c
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: secrets-c-sarif
+          path: semgrep-secrets.sarif
+          retention-days: 7

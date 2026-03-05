@@ -1,0 +1,422 @@
+name: GitHub Actions Security
+on:
+  workflow_call:
+    inputs:
+      pr_base_sha:
+        type: string
+      pr_head_sha:
+        type: string
+      runner_labels:
+        type: string
+        default: '"ubuntu-24.04"'
+      enable_zizmor:
+        type: boolean
+        default: true
+      enable_poutine:
+        type: boolean
+        default: true
+      enable_actionlint:
+        type: boolean
+        default: true
+      enable_exploit_guards:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor (GHA Security Analysis)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # fetch-depth: 1 (default) — these scanners analyze current YAML files only; git history not needed.
+
+      # NOTE: GitHub Actions has no step-level sharing across jobs, so this detection
+      # step is intentionally duplicated for each job in this workflow. Update all
+      # copies when the detection logic changes.
+      - name: Check for workflow files
+        id: check_workflows
+        run: |
+          has_workflows=false
+          if find .github/workflows -name '*.yml' -o -name '*.yaml' \
+             2>/dev/null | grep -q .; then
+            has_workflows=true
+          fi
+          # Also detect composite action definitions outside .github/
+          if find . \( -name 'action.yml' -o -name 'action.yaml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               2>/dev/null | grep -q .; then
+            has_workflows=true
+            echo "has_composite_actions=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_workflows=$has_workflows" >> "$GITHUB_OUTPUT"
+
+      - name: zizmor disabled
+        if: steps.check_workflows.outputs.has_workflows == 'true' && !inputs.enable_zizmor
+        run: |
+          echo '::notice title=Tool Disabled::zizmor is disabled. Set enable_zizmor: true to re-enable.'
+
+      - name: Install zizmor
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_zizmor
+        run: |
+          for i in 1 2 3; do
+            pip install zizmor==1.5.2 && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install zizmor after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run zizmor
+        id: run_zizmor
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_zizmor
+        continue-on-error: true
+        env:
+          HAS_COMPOSITES: ${{ steps.check_workflows.outputs.has_composite_actions }}
+        run: |
+          # Uses a bash array to safely handle paths containing spaces.
+          SCAN_PATHS=(".github/")
+          if [ "$HAS_COMPOSITES" = "true" ]; then
+            while IFS= read -r action_file; do
+              action_dir=$(dirname "$action_file")
+              SCAN_PATHS+=("$action_dir/")
+            done < <(find . \( -name 'action.yml' -o -name 'action.yaml' \) \
+                 -not -path './.git/*' -not -path '*/node_modules/*' -not -path './.github/*' 2>/dev/null)
+          fi
+          zizmor --format sarif "${SCAN_PATHS[@]}" > zizmor.sarif
+
+      - name: Check zizmor result
+        if: steps.run_zizmor.outcome == 'failure'
+        run: echo "::warning title=zizmor::zizmor exited non-zero — results may be incomplete"
+
+      - name: Validate zizmor SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_zizmor
+        run: |
+          set -euo pipefail
+          [ -s zizmor.sarif ] || { echo "::error::zizmor.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('zizmor.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::zizmor produced {n} finding(s)' if n else '::notice::zizmor completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_zizmor
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zizmor-sarif
+          path: zizmor.sarif
+          retention-days: 7
+
+  poutine:
+    name: poutine (GHA Supply-Chain Analysis)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # fetch-depth: 1 (default) — these scanners analyze current YAML files only; git history not needed.
+
+      # NOTE: GitHub Actions has no step-level sharing across jobs, so this detection
+      # step is intentionally duplicated for each job in this workflow. Update all
+      # copies when the detection logic changes.
+      - name: Check for workflow files
+        id: check_workflows
+        run: |
+          has_workflows=false
+          if find .github/workflows -name '*.yml' -o -name '*.yaml' \
+             2>/dev/null | grep -q .; then
+            has_workflows=true
+          fi
+          # Also detect composite action definitions outside .github/
+          if find . \( -name 'action.yml' -o -name 'action.yaml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               2>/dev/null | grep -q .; then
+            has_workflows=true
+            echo "has_composite_actions=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_workflows=$has_workflows" >> "$GITHUB_OUTPUT"
+
+      - name: poutine disabled
+        if: steps.check_workflows.outputs.has_workflows == 'true' && !inputs.enable_poutine
+        run: |
+          echo '::notice title=Tool Disabled::poutine is disabled. Set enable_poutine: true to re-enable.'
+
+      - name: Install poutine
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_poutine
+        run: |
+          case "$(uname -m)" in
+            x86_64)  POUTINE_ARCH="x86_64"; POUTINE_SHA256="4fe8d9c9b14d5c212735a53a5463e2d0ba4a860efa5d078c837f3531d7fac870" ;;  # Supply-chain guard
+            aarch64) POUTINE_ARCH="arm64";  POUTINE_SHA256="d4c6f98a585ada63d8dd726dc5866891d2ac7bf04ced46a02076f4457bdd8374" ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+          for i in 1 2 3; do
+            curl -fsSL "https://github.com/boostsecurityio/poutine/releases/download/v0.18.0/poutine_Linux_${POUTINE_ARCH}.tar.gz" -o poutine.tar.gz && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to download poutine after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "$POUTINE_SHA256  poutine.tar.gz" | sha256sum -c - || { echo "Checksum verification failed!"; exit 1; }
+          tar -xzf poutine.tar.gz poutine
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv poutine "$RUNNER_TEMP/bin/poutine"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Run poutine
+        id: run_poutine
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_poutine
+        continue-on-error: true
+        run: poutine analyze-local . --format sarif > poutine.sarif
+
+      - name: Check poutine result
+        if: steps.run_poutine.outcome == 'failure'
+        run: echo "::warning title=poutine::poutine exited non-zero — results may be incomplete"
+
+      - name: Validate poutine SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_poutine
+        run: |
+          set -euo pipefail
+          [ -s poutine.sarif ] || { echo "::error::poutine.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('poutine.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::poutine produced {n} finding(s)' if n else '::notice::poutine completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_poutine
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: poutine-sarif
+          path: poutine.sarif
+          retention-days: 7
+
+  actionlint:
+    name: actionlint (Workflow Security)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # fetch-depth: 1 (default) — these scanners analyze current YAML files only; git history not needed.
+
+      # NOTE: GitHub Actions has no step-level sharing across jobs, so this detection
+      # step is intentionally duplicated for each job in this workflow. Update all
+      # copies when the detection logic changes.
+      - name: Check for workflow files
+        id: check_workflows
+        run: |
+          has_workflows=false
+          if find .github/workflows -name '*.yml' -o -name '*.yaml' \
+             2>/dev/null | grep -q .; then
+            has_workflows=true
+          fi
+          # Also detect composite action definitions outside .github/
+          if find . \( -name 'action.yml' -o -name 'action.yaml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               2>/dev/null | grep -q .; then
+            has_workflows=true
+            echo "has_composite_actions=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_workflows=$has_workflows" >> "$GITHUB_OUTPUT"
+
+      - name: actionlint disabled
+        if: steps.check_workflows.outputs.has_workflows == 'true' && !inputs.enable_actionlint
+        run: |
+          echo '::notice title=Tool Disabled::actionlint is disabled. Set enable_actionlint: true to re-enable.'
+
+
+      - name: Set up Go for actionlint
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_actionlint
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24.1'
+          cache: false
+
+      - name: Install actionlint
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_actionlint
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          # go install pins to an exact version tag. Supply-chain integrity is enforced by
+          # the Go checksum database (sum.golang.org), which verifies the module hash for
+          # every tagged release and makes tag mutation attacks publicly detectable.
+          # This is equivalent security to SHA256-verifying a pre-built binary for our
+          # threat model. Alternative: download a release binary + SHA256 verify (like PMD).
+          ACTIONLINT_VERSION="1.7.11"
+          for i in 1 2 3; do
+            GOBIN="$RUNNER_TEMP/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION} && break
+            [ "$i" -lt 3 ] || { echo "::error::Failed to install actionlint after 3 attempts"; exit 1; }
+            echo "Attempt $i/3 failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Run actionlint
+        id: run_actionlint
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_actionlint
+        continue-on-error: true
+        run: actionlint -format '{{range .}}{{json .}}{{"\n"}}{{end}}' > actionlint.json 2>actionlint.err
+
+      - name: Check actionlint result
+        if: steps.run_actionlint.outcome == 'failure'
+        run: echo "::warning title=actionlint::actionlint exited non-zero — results may be incomplete"
+
+      - name: Convert to SARIF
+        if: always() && steps.run_actionlint.outcome != 'failure' && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_actionlint
+        run: |
+          python3 << 'PYEOF'
+          import json
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "actionlint",
+                          "version": "1.7.11",
+                          "informationUri": "https://github.com/rhysd/actionlint"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+
+          try:
+              with open('actionlint.json', 'r') as f:
+                  content = f.read().strip()
+              if not content:
+                  # No findings
+                  with open('actionlint.sarif', 'w') as f:
+                      json.dump(sarif, f, indent=2)
+                  raise SystemExit(0)
+
+              for line in content.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      finding = json.loads(line)
+                      kind = finding.get("kind", "actionlint")
+                      error_kinds = {'expression', 'permissions', 'credentials', 'id', 'env-var'}
+                      result = {
+                          "ruleId": kind,
+                          "level": "error" if kind in error_kinds else "warning",
+                          "message": {"text": finding.get("message", "actionlint finding")},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": finding.get("filepath", "unknown")},
+                                  "region": {
+                                      "startLine": finding.get("line", 1),
+                                      "startColumn": finding.get("column", 1)
+                                  }
+                              }
+                          }]
+                      }
+                      sarif["runs"][0]["results"].append(result)
+                  except Exception as e:
+                      print(f"Warning: skipping malformed actionlint finding: {e}")
+          except SystemExit:
+              raise
+          except Exception as e:
+              print(f"Warning: error reading actionlint.json: {e}")
+
+          with open('actionlint.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          PYEOF
+
+      - name: Validate actionlint SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_actionlint
+        run: |
+          set -euo pipefail
+          [ -s actionlint.sarif ] || { echo "::error::actionlint.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('actionlint.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::actionlint produced {n} finding(s)' if n else '::notice::actionlint completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_actionlint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: actionlint-sarif
+          path: actionlint.sarif
+          retention-days: 7
+
+  # ── exploit-guards ────────────────────────────────────────────────
+  exploit-guards:
+    name: exploit-guards (GHA Exploit-Pattern Analysis)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # fetch-depth: 1 (default) — these scanners analyze current YAML files only; git history not needed.
+
+      # NOTE: GitHub Actions has no step-level sharing across jobs, so this detection
+      # step is intentionally duplicated for each job in this workflow. Update all
+      # copies when the detection logic changes.
+      - name: Check for workflow files
+        id: check_workflows
+        run: |
+          has_workflows=false
+          if find .github/workflows -name '*.yml' -o -name '*.yaml' \
+             2>/dev/null | grep -q .; then
+            has_workflows=true
+          fi
+          # Also detect composite action definitions outside .github/
+          if find . \( -name 'action.yml' -o -name 'action.yaml' \) \
+               -not -path './.git/*' -not -path '*/node_modules/*' \
+               2>/dev/null | grep -q .; then
+            has_workflows=true
+            echo "has_composite_actions=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_workflows=$has_workflows" >> "$GITHUB_OUTPUT"
+
+      - name: exploit-guards disabled
+        if: steps.check_workflows.outputs.has_workflows == 'true' && !inputs.enable_exploit_guards
+        run: |
+          echo '::notice title=Tool Disabled::exploit-guards is disabled. Set enable_exploit_guards: true to re-enable.'
+
+      - name: Run exploit-guards
+        id: run_exploit_guards
+        if: steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_exploit_guards
+        continue-on-error: true
+        uses: ./.github/actions/exploit-guards
+        with:
+          target-dir: '.'
+
+      - name: Check exploit-guards result
+        if: steps.run_exploit_guards.outcome == 'failure'
+        run: echo "::warning title=exploit-guards::exploit-guards exited non-zero — results may be incomplete"
+
+      - name: Validate exploit-guards SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_exploit_guards
+        run: |
+          set -euo pipefail
+          [ -s exploit-guards.sarif ] || { echo "::error::exploit-guards.sarif was not generated. Scanner did not produce output — check install and run steps above."; exit 1; }
+          python3 -c "import json; data=json.load(open('exploit-guards.sarif')); assert isinstance(data.get('runs'), list); n=sum(len(r.get('results',[])) for r in data['runs']); print(f'::notice::exploit-guards produced {n} finding(s)' if n else '::notice::exploit-guards completed with no findings')"
+
+      - name: Upload SARIF
+        if: always() && steps.check_workflows.outputs.has_workflows == 'true' && inputs.enable_exploit_guards
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: exploit-guards-sarif
+          path: exploit-guards.sarif
+          retention-days: 7
