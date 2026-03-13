@@ -1,0 +1,12 @@
+name: deployment-payload-context
+on:
+  deployment:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "${{ github.event.deployment.payload.version }}"

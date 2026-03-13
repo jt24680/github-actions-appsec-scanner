@@ -1,0 +1,15 @@
+# Intentionally uses deprecated K8s API version for Pluto testing.
+# networking.k8s.io/v1beta1 Ingress was deprecated in 1.19, removed in 1.22.
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: test-ingress
+spec:
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: test-service
+              servicePort: 80

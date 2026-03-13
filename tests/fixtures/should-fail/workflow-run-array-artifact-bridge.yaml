@@ -1,0 +1,11 @@
+name: workflow_run array + artifact bridge
+on: [workflow_run]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: echo "should fail exploit-guards"

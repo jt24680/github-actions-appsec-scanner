@@ -1,0 +1,12 @@
+name: project-card-note
+on:
+  project_card:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "${{ github.event.project_card.note }}"

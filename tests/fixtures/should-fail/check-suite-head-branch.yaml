@@ -1,0 +1,12 @@
+name: check-suite-head-branch
+on:
+  check_suite:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "${{ github.event.check_suite.head_branch }}"

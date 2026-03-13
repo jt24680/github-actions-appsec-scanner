@@ -1,0 +1,12 @@
+name: quoted-runs-on-self-hosted
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  test:
+    "runs-on": [self-hosted, linux]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - run: echo ok

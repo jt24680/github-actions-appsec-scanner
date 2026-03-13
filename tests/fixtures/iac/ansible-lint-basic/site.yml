@@ -1,0 +1,4 @@
+- hosts: all
+  tasks:
+    - name: Include deploy playbook
+      include_tasks: playbooks/deploy.yml

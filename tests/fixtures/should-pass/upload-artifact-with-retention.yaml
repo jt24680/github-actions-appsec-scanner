@@ -1,0 +1,17 @@
+name: upload-artifact with retention
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - run: echo "{}" > report.sarif
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: report
+          path: report.sarif
+          retention-days: 3

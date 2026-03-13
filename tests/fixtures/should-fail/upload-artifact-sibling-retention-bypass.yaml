@@ -1,0 +1,23 @@
+name: upload artifact sibling retention bypass
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - run: |
+          echo "one" > one.txt
+          echo "two" > two.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: one
+          path: one.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: two
+          path: two.txt
+          retention-days: 2

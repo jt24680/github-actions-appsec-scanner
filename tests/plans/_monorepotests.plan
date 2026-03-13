@@ -1,0 +1,109 @@
+Monorepo Compatibility Test Plan
+
+Scope
+- Capture multiple ways to test monorepo compatibility for the GitHub Actions AppSec scanner.
+- Record current testing context so future work can build from the present baseline.
+
+Approach Options
+
+1. Fixture-based routing tests
+- Add monorepo fixtures with multiple languages in sibling directories.
+- Include nested apps such as `services/api`, `libs/shared`, and `infra/terraform`.
+- Assert which workflows should trigger, which tools should enable, and which paths should be discovered.
+
+2. Detection contract tests
+- Test the detection layer directly instead of full workflows.
+- Cover changed-file to scanner routing, per-language project root discovery, depth limits, path heuristics, and docs-only changes.
+- Use this as the fastest signal for monorepo regressions.
+
+3. Golden-output tests for changed path sets
+- Feed known changed-file lists into detection logic.
+- Compare outputs against checked-in expected files.
+- Validate enabled scanners, discovered projects, tool flags, and expected artifact names.
+
+4. End-to-end workflow smoke tests with `act`
+- Run representative monorepo fixtures through the reusable orchestrator.
+- Cover one-service changes, shared-library changes, infra-only changes, and lockfile-only changes.
+- Use this to catch integration bugs across detect, child workflows, and reporting.
+
+5. Matrix tests over monorepo shapes
+- Test shallow vs deep nesting.
+- Test single-root vs many-package layouts.
+- Test single-language vs polyglot repos.
+- Test root lockfiles vs per-package lockfiles.
+- Test leaf-dir changes vs shared-dir changes.
+
+6. Property-style tests for path discovery
+- Assert invariants instead of exact YAML behavior.
+- Examples:
+- adding unrelated files must not enable extra scanners
+- docs-only changes must not trigger language scanners
+- changed lockfiles must not reduce dependency coverage
+- supported nesting depths should continue to resolve projects
+
+7. Regression fixtures for known monorepo edge cases
+- Preserve minimal fixtures for every discovered bug.
+- Good candidates:
+- nested `package.json` beyond current depth
+- multiple `go.mod` files
+- mixed `Gemfile.lock` and Rails app roots
+- Terraform and Kubernetes files in nonstandard locations
+
+8. Performance-aware tests
+- Assert only changed packages are selected.
+- Assert target lists are deduplicated.
+- Assert large monorepos do not silently fall back to scanning everything unless explicitly intended.
+
+9. Report aggregation tests
+- Validate many-artifact monorepo behavior.
+- Ensure multiple packages of the same language merge correctly.
+- Ensure package identity is preserved in summaries.
+- Ensure one failed package does not hide other results.
+- Ensure skipped scanners do not imply a false-clean report.
+
+10. Consumer-compatibility tests
+- Test reusable-workflow callers representing downstream monorepos.
+- Cover full scans, partial path-driven scans, and selective scanner enablement for polyglot repos.
+- Validate the public workflow API, not only internal implementation details.
+
+Recommended Rollout Order
+1. Detection contract tests.
+2. Monorepo fixture routing tests.
+3. A small set of `act` end-to-end smoke tests.
+4. Golden-output tests for reporting and aggregation.
+
+Current Context
+- Repo in scope: `github-actions-appsec-scanner`.
+- Existing offline suite: `tests/test-offline.sh`.
+- Recent work added a `Workflow Exploit Guards` section with static checks for risky workflow patterns.
+- Additional exploit-guard checks were added for:
+- `workflow_run`
+- artifact-bridge patterns
+- untrusted GitHub context inside `run:` blocks
+- untrusted GitHub context inside `actions/github-script` `script:` blocks
+- untrusted GitHub context inside local `action.yml` / `action.yaml` run blocks
+- `inputs.*` interpolation inside shell-like blocks
+- untrusted writes to `$GITHUB_ENV`, `$GITHUB_OUTPUT`, and `$GITHUB_PATH`
+- untrusted values in `env:` blocks
+- write-scoped jobs that mix checkout with execution logic
+- `secrets: inherit`
+- branch/ref context leakage into shell-like and env blocks
+
+Validation Status
+- `bash tests/test-offline.sh` was run after the exploit-guard additions.
+- All new exploit-guard checks passed.
+- The full suite still exits non-zero because of unrelated pre-existing failures.
+- Current known unrelated failures are concentrated around `actionlint` expectations and fixture-manifest coverage.
+- The last observed suite summary was:
+- Passed: 637
+- Failed: 11
+- Skipped: 0
+
+Relevant Current Gaps for Monorepo Testing
+- Need dedicated monorepo fixtures rather than single-project fixtures only.
+- Need direct tests for detection heuristics in nested and polyglot repository layouts.
+- Need explicit tests for report behavior when many packages in one repo emit SARIF simultaneously.
+- Need compatibility tests for downstream reusable-workflow consumers operating on monorepos.
+
+Suggested Next Step
+- Create a dedicated `tests/fixtures/monorepo/` tree with a small, high-signal set of polyglot fixtures and wire them first into detection/routing assertions before adding heavier end-to-end coverage.

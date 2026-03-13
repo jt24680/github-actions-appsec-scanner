@@ -1,0 +1,13 @@
+name: bracket-notation-run-context
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - run: echo "${{ github['event']['pull_request']['title'] }}"

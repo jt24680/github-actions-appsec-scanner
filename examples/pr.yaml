@@ -1,0 +1,32 @@
+name: AppSec
+on:
+  pull_request:
+
+# Cancel the in-progress scan for this PR when a new commit is pushed.
+concurrency:
+  group: appsec-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # required for enable_pr_comment
+  # security-events: write  # uncomment if you set enable_code_scanning_upload: true
+
+jobs:
+  scan:
+    # Replace @main with a pinned commit SHA for supply-chain security, e.g.:
+    #   your-org/github-actions-appsec-scanner/.github/workflows/orchestrator-reusable.yaml@abc1234
+    uses: your-org/github-actions-appsec-scanner/.github/workflows/orchestrator-reusable.yaml@main
+    secrets:
+      # Optional — enables Semgrep Pro rules.
+      # Note: secrets are NOT passed to workflows triggered by pull_request events from forks.
+      # Keep pull_request for untrusted forks; use a separate trusted workflow_call path for privileged follow-up.
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}  # enables diff-only scanning
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}  # enables diff-only scanning
+      scanners: all           # run every language scanner that detects matching files
+      disabled_tools: ''      # to skip specific tools, e.g.: 'syft,grype'
+      enable_report: true     # aggregate all SARIF results into a single report artifact
+      enable_pr_comment: true # post a findings summary comment on the pull request
+      # enable_code_scanning_upload: false  # set true + add security-events: write to upload to Code Scanning

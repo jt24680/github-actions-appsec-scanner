@@ -1,0 +1,12 @@
+name: gh cli untrusted interpolation
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - run: gh pr create --title "${{ github.event.pull_request.title }}" --body "test"

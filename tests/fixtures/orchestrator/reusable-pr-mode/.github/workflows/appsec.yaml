@@ -1,0 +1,17 @@
+name: AppSec Reusable PR
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  scan:
+    uses: your-org/github-actions-appsec-scanner/.github/workflows/orchestrator-reusable.yaml@main  # zizmor:ignore[unpinned-uses]
+    secrets:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    with:
+      pr_base_sha: ${{ github.event.pull_request.base.sha }}
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+      enable_pr_comment: true

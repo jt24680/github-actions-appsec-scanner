@@ -1,0 +1,12 @@
+name: deployment-status-env
+on:
+  deployment_status:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "${{ github.event.deployment_status.environment }}"

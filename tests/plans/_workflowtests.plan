@@ -1,0 +1,420 @@
+Workflow Testing Plan
+
+Scope
+- Capture the testing strategy for this repo after Mode B removal.
+- Separate local shell-based tests from actual GitHub workflow tests.
+- Preserve the rationale, auth requirements, and recommended next steps.
+
+Core Rule
+- If `tests/test-offline.sh` can prove it with static checks, it does not belong in a GitHub-hosted workflow test.
+- If `tests/test-act.sh` can fake it locally with sufficient confidence, it usually does not belong in a GitHub-hosted workflow test.
+- Actual GitHub workflow tests should cover only live-environment regressions that require GitHub Actions itself, real marketplace action resolution, real artifact services, real permissions, or real GitHub API behavior.
+
+Current Test Layers
+
+1. Offline tests
+- File: `tests/test-offline.sh`
+- Purpose: static contract checks against workflow YAML and repo structure.
+- Good for:
+  - reusable workflow input shapes
+  - orchestrator forwarding
+  - presence/absence of steps
+  - no stale Mode B references
+  - SARIF validation step structure
+  - pinned SHAs and image digests
+- Not good for:
+  - real upstream package installs
+  - advisory DB access
+  - artifact upload/download
+  - PR comment behavior
+  - real GitHub runner behavior
+
+2. act-based smoke tests
+- File: `tests/test-act.sh`
+- Purpose: local execution smoke tests with GitHub Actions approximated by `act`.
+- Good for:
+  - basic reusable-workflow execution
+  - fixture-driven smoke runs
+  - local orchestration sanity checks
+  - regression checks that do not depend on real GitHub services
+- Not good for:
+  - GitHub artifact service correctness
+  - real `GITHUB_TOKEN` permission behavior
+  - PR comment integration
+  - exact marketplace action/runtime behavior on GitHub-hosted runners
+
+3. Online tests
+- File: `tests/test-online.sh`
+- Purpose: laptop-friendly live smoke tests against real upstream package ecosystems and advisory services.
+- Good for:
+  - install/download drift
+  - advisory DB availability
+  - schema drift in tool output
+  - end-to-end local invocation of real tools
+- Not good for:
+  - GitHub API tests
+  - workflow_dispatch via GitHub unless explicit auth is provided
+  - artifact upload/download validation
+  - PR comment tests
+
+Definition: "Live smoke"
+- A live smoke test is not just "can I install the tool".
+- It should prove four things:
+  1. the tool can be installed or invoked from the real upstream source
+  2. the tool can talk to the live service it depends on
+  3. the tool can run against a minimal real fixture
+  4. the output format is still parseable by the repo's expectations
+
+Laptop-Friendly Online Tests
+- These make sense in `tests/test-online.sh` because they can run from a laptop without requiring GitHub-hosted workflow context.
+
+1. `pip-audit live smoke`
+- Install or invoke `pip-audit`
+- Run against a minimal `requirements.txt`
+- Verify JSON output exists and parses
+
+2. `cargo-audit live smoke`
+- Install `cargo-audit`
+- Run `cargo audit --json` in a tiny Rust fixture
+- Verify JSON output exists and parses
+
+3. `composer audit live smoke`
+- Run `composer update` / `composer audit --format=json` in a tiny PHP fixture
+- Verify JSON output exists and parses
+
+4. `bundler-audit --update live smoke`
+- Install `bundler-audit`
+- Update the advisory DB
+- Run against a minimal `Gemfile.lock`
+- Verify output exists and the update path still works
+
+5. `govulncheck schema canary`
+- Install `govulncheck`
+- Run `govulncheck -json ./...` in a tiny Go fixture
+- Verify JSONL output parses line by line
+
+Authentication Expectations for Laptop Runs
+- Running `tests/test-online.sh` locally does not automatically provide `GITHUB_TOKEN`.
+- Public package-manager installs and public advisory lookups usually do not need GitHub auth.
+- GitHub-specific tests usually do.
+
+Usually no credentials needed locally
+- `pip-audit` live smoke
+- `cargo-audit` live smoke
+- `composer audit` live smoke
+- `bundler-audit --update` live smoke
+- `govulncheck` schema canary
+
+May require auth if expanded later
+- `gh workflow run`
+- GitHub REST/GraphQL checks
+- PR comment validation
+- private package registry access
+- private repository checkout or action resolution
+
+Actual GitHub Workflow Tests
+- These are workflows that run inside GitHub Actions to test other workflows in GitHub Actions.
+- They are stronger than `act`, but slower and more brittle.
+
+How They Work
+1. A test workflow is triggered by `workflow_dispatch`, `schedule`, or PR.
+2. It prepares a tiny fixture repo or generated project.
+3. It runs the workflow under test for real.
+4. It asserts on GitHub-native outcomes such as job completion, artifacts, report output, or PR comments.
+5. It fails if the expected behavior did not happen.
+
+Two Main Styles
+
+1. Reusable-workflow test
+- The test workflow directly calls a reusable workflow with:
+  - `uses: ./.github/workflows/security-python.yaml`
+  - similar for other scanner workflows
+- Best for language-specific smoke coverage
+- Simpler than orchestrator dispatch
+
+2. Full orchestrator test
+- The test workflow exercises `.github/workflows/_orchestrator-ci.yaml` (or `_orchestrator-pr.yaml` for PR events)
+- Best for validating:
+  - `detect`
+  - scanner selection
+  - report aggregation
+  - end-to-end workflow behavior
+- Closest to production behavior
+
+Fixture Strategy
+- Fixtures are tiny sample source trees committed under `tests/fixtures/`.
+- They are real code or config files, not mocks.
+- Use them to drive real scanner execution and then assert on stable outputs.
+- Do not maintain nested git repos under `tests/fixtures/`.
+- For PR-routing tests, generate git history in a temporary repo during the test run.
+
+Recommended Fixture Layout
+- `tests/fixtures/<language-or-scope>/<scenario>/...`
+- Each fixture should include only the minimum files needed to trigger the intended tool behavior.
+- Keep one behavior per fixture whenever possible.
+- Prefer a positive and negative pair for deterministic tools.
+
+Suggested companion metadata per fixture
+- `expected.json`
+- `meta.json`
+
+`expected.json` should contain only stable assertions such as:
+- expected tool name
+- assertion mode: `exact`, `minimum`, or `shape`
+- expected rule IDs
+- expected severity levels
+- expected file paths
+- expected count when the result set is deterministic
+
+Fixture Test Classes
+
+1. Deterministic fixtures
+- Use for static analyzers and linters where the same tiny input should produce the same findings every run.
+- These should aim for exact assertions on `ruleId`, severity, path, and count.
+
+2. Bounded-drift fixtures
+- Use for dependency/advisory tools where package ecosystems or vulnerability databases can change.
+- These should assert execution, parseability, and the presence of an expected class of finding unless the tool can be run against a pinned offline database.
+
+3. GitHub-native integration fixtures
+- Use for report aggregation, artifact handling, permissions, PR comments, and routing behavior.
+- These assert on workflow outcomes rather than source findings alone.
+
+Recommended Initial Deterministic Fixture Backlog
+- `general/semgrep-basic-positive`
+- `general/semgrep-basic-negative`
+- `general/trufflehog-fake-secret-positive`
+- `general/trufflehog-clean-negative`
+- `python/bandit-shell-true-positive`
+- `python/bandit-clean-negative`
+- `go/gosec-hardcoded-secret-positive`
+- `go/gosec-clean-negative`
+- `go/staticcheck-basic-positive`
+- `java/pmd-basic-positive`
+- `java/pmd-clean-negative`
+- `php/phpstan-type-error-positive`
+- `php/phpstan-clean-negative`
+- `ruby/rubocop-basic-positive`
+- `rails/brakeman-basic-positive`
+- `sql/sqlfluff-basic-positive`
+- `sql/tsqllint-basic-positive`
+- `powershell/psscriptanalyzer-basic-positive`
+- `c/flawfinder-unsafe-function-positive`
+- `c/cppcheck-basic-positive`
+- `rust/clippy-basic-positive`
+- `iac/checkov-public-resource-positive`
+- `iac/checkov-clean-negative`
+- `iac/ansible-lint-basic-positive`
+
+Recommended Initial Bounded-Drift Fixture Backlog
+- `python/pip-audit-vuln`
+- `js/npm-audit-vuln`
+- `php/composer-audit-vuln`
+- `ruby/bundler-audit-vuln`
+- `rust/cargo-audit-vuln`
+- `go/govulncheck-vuln`
+- `dotnet/dotnet-audit-vuln`
+- `general/trivy-vuln-positive`
+- `general/trivy-license-positive`
+
+TruffleHog Fixture Notes
+- A fake-secret fixture is viable for TruffleHog.
+- Use intentionally fake but pattern-valid secrets to test detection, not provider-backed secret verification.
+- Good candidates:
+  - AWS-style access key shape
+  - GitHub token shape
+  - Slack token shape
+  - generic high-entropy credential blob
+- Positive fixture expectations:
+  - the TruffleHog job runs
+  - SARIF is generated
+  - at least one finding is emitted
+  - the finding path matches the planted file
+- Negative fixture expectations:
+  - the TruffleHog job runs
+  - SARIF is generated
+  - no findings are emitted
+- Treat the positive TruffleHog fixture as `shape` or `minimum` assertion mode unless the chosen fake strings prove stable across TruffleHog versions.
+
+Recommended Orchestrator Fixture Backlog
+- `orchestrator/python-only`
+- `orchestrator/go-and-python`
+- `orchestrator/iac-and-general`
+- `orchestrator/dotnet-matrix`
+
+Success Bar by Class
+- deterministic: exact assertions on findings
+- bounded-drift: stable shape assertions unless the upstream DB is pinned
+- GitHub-native: assertions on job routing, artifact presence, summary content, and comment behavior
+
+What Belongs in Actual GitHub Workflow Tests
+
+1. `workflow_dispatch orchestrator smoke`
+- Trigger `_orchestrator-ci.yaml` on GitHub Actions
+- Verify `detect`, selected scanners, and `report` complete successfully
+
+2. `workflow_dispatch scanner selection`
+- Dispatch with `scanners=python,go`
+- Verify only the expected scanner jobs run
+
+3. `workflow_dispatch disabled_tools selection`
+- Dispatch with a `disabled_tools` subset
+- Verify those tools emit disabled notices and do not run
+
+4. `pull_request changed-files routing`
+- Use a controlled fixture PR
+- Verify `detect` routes work based on changed files
+
+5. `artifact aggregation smoke`
+- Verify scanner SARIF artifacts upload and the report job downloads and aggregates them
+
+6. `report summary generation`
+- Verify the report job produces a non-empty summary with expected sections and links
+
+7. `PR comment smoke`
+- On a disposable PR, verify the workflow can post the summary comment
+
+8. `PR comment update behavior`
+- Verify reruns update or replace the intended comment cleanly
+
+9. `python live scanner smoke`
+- Real GitHub Actions execution of Bandit and/or pip-audit against a tiny fixture
+
+10. `go live scanner smoke`
+- Real execution of Gosec, Staticcheck, and/or Govulncheck
+
+11. `rust live scanner smoke`
+- Real execution of cargo-audit and Clippy
+
+12. `java PMD live smoke`
+- Real PMD download/install/run on a GitHub-hosted runner
+
+13. `php live scanner smoke`
+- Real PHPStan / Composer audit execution
+
+14. `ruby live scanner smoke`
+- Real RuboCop / bundler-audit execution
+
+15. `sql live scanner smoke`
+- Real SQLFluff / TSQLLint execution
+
+16. `powershell live scanner smoke`
+- Real PSScriptAnalyzer execution on Ubuntu runner using `pwsh`
+
+17. `iac live scanner smoke`
+- Real Checkov / ansible-lint execution
+
+18. `semgrep/trivy/trufflehog general smoke`
+- Real execution of cross-cutting general security workflow jobs
+
+19. `dependency/advisory upstream canary`
+- Nightly canary for the tools most likely to break due to upstream drift
+
+20. `permissions/fork-safe behavior`
+- Verify graceful degradation with restricted token permissions
+
+21. `runner image compatibility canary`
+- Confirm assumptions about `ubuntu-24.04` and installed tools still hold
+
+22. `matrix artifact naming collision test`
+- Confirm `.NET` matrix jobs produce unique artifacts and aggregate correctly
+
+23. `failure-path report warning test`
+- Intentionally force scanner failures and verify the report warns instead of implying a clean run
+
+24. `manual-dispatch no-PR-context smoke`
+- Verify `workflow_dispatch` whole-repo scanning still works without PR SHAs
+
+Authentication Expectations for Actual GitHub Workflow Tests
+
+No extra secrets in many same-repo cases
+- GitHub Actions injects `GITHUB_TOKEN` automatically when the test itself runs in GitHub Actions
+- Same-repo workflow execution usually works with the default token for:
+  - orchestrator smoke
+  - artifact aggregation
+  - summary generation
+  - many same-repo actions and artifact operations
+
+May require `GITHUB_TOKEN` permissions beyond defaults
+- PR comment smoke
+- PR comment update behavior
+- some workflow-dispatch/API-driven orchestration
+
+May require extra credentials/secrets
+- tests against private package registries
+- tests against private repos
+- dispatching or commenting in separate test repos
+- cross-repo fixture management
+
+What Should Not Be Added as Actual GitHub Workflow Tests
+- static YAML presence checks
+- step-name checks
+- pinned-version grep checks
+- reusable workflow input shape checks already covered offline
+- behavior that `act` already covers with high confidence and no GitHub-specific dependency
+
+Recommended Minimal Actual GitHub Workflow Test Set
+- If this repo adds real GitHub-hosted workflow tests later, start with only these:
+
+1. `workflow_dispatch orchestrator smoke`
+- highest-value end-to-end production-like check
+
+2. `artifact aggregation smoke`
+- validates GitHub artifact service plus report job integration
+
+3. `report summary generation`
+- validates final user-visible output path
+
+4. `PR comment smoke` only if PR comments are operationally important
+- skip otherwise
+
+5. one upstream drift canary as a scheduled workflow
+- e.g. python or go, not every ecosystem at first
+
+Recommended Minimal Local Online Test Set
+- Already aligned to the current `tests/test-online.sh`
+
+1. `pip-audit live smoke`
+2. `cargo-audit live smoke`
+3. `composer audit live smoke`
+4. `bundler-audit --update live smoke`
+5. `govulncheck schema canary`
+
+Suggested Rollout Order
+
+Phase 1: maintain local confidence
+- keep `tests/test-offline.sh` strong
+- keep `tests/test-act.sh` focused on reusable workflow smoke behavior
+- keep `tests/test-online.sh` focused on live upstream/package/advisory behavior
+
+Phase 2: add deterministic fixture coverage
+- add the highest-value deterministic fixtures first: Semgrep, TruffleHog, Bandit, Checkov, Gosec, PMD
+- wire those fixtures into reusable-workflow tests before expanding orchestrator coverage
+
+Phase 3: add one real GitHub workflow canary
+- add `workflow_dispatch orchestrator smoke`
+- make it manually triggerable first
+
+Phase 4: add one GitHub-native integration check
+- add `artifact aggregation smoke`
+
+Phase 5: add bounded-drift advisory fixtures
+- add dependency/advisory fixtures with explicit `bounded-drift` expectations
+- do not use exact finding-count assertions unless the advisory source is pinned
+
+Phase 6: add PR comment validation only if needed
+- requires cleaner fixture/repo setup and permissions discipline
+
+Implementation Notes for Future Work
+- Prefer tiny generated fixtures over large committed test repos
+- Prefer committed tiny source trees plus generated temporary git history over committed fake git repos
+- Prefer same-repo reusable-workflow calls first
+- Avoid broad nightly matrixes at the start
+- Keep GitHub-hosted tests small and deterministic
+- Expect some flakiness from upstream advisory services; use retries where justified
+
+Success Criteria
+- Offline tests catch static regressions quickly
+- act tests catch local workflow execution regressions
+- online tests catch upstream install/advisory/schema drift
+- actual GitHub workflow tests catch GitHub-native integration regressions

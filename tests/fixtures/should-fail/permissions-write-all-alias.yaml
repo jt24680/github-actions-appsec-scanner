@@ -1,0 +1,14 @@
+name: permissions write-all alias
+on: push
+
+x-perms: &all_perms write-all
+permissions: *all_perms
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - run: echo "should fail exploit-guards"

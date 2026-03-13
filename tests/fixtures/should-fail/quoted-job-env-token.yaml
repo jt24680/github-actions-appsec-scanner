@@ -1,0 +1,14 @@
+name: quoted-job-env-token
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    "env":
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - run: echo ok

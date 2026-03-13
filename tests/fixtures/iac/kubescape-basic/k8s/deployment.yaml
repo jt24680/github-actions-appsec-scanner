@@ -1,0 +1,21 @@
+# Intentionally insecure K8s Deployment for Kubescape testing.
+# Missing: securityContext, resource limits, readiness probes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-app
+  template:
+    metadata:
+      labels:
+        app: test-app
+    spec:
+      containers:
+        - name: test-app
+          image: nginx:latest
+          ports:
+            - containerPort: 80

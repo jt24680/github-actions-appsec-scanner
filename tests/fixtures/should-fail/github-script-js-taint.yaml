@@ -1,0 +1,15 @@
+name: github-script-js-taint
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/github-script@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          script: |
+            const {execSync} = require("child_process");
+            execSync(context.payload.pull_request.title);

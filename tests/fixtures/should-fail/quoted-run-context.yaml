@@ -1,0 +1,15 @@
+name: quoted-run-context
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - "run": echo "${{ github.event.pull_request.title }}"
